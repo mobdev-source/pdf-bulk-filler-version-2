@@ -10,6 +10,42 @@ import pandas as pd
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 import fitz
+from qfluentwidgets import (
+    FluentIcon as FI,
+    Theme,
+    ThemeColor,
+    setTheme,
+    setThemeColor,
+)
+from qfluentwidgets.common.config import qconfig
+
+
+def get_fluent_icon(*names: str, default: FI = FI.INFO) -> QtGui.QIcon:
+    """Return the first available Fluent icon tinted for the active theme."""
+    icon_choice = default
+    for name in names:
+        icon_candidate = getattr(FI, name, None)
+        if icon_candidate is not None:
+            icon_choice = icon_candidate
+            break
+
+    light_color = QtGui.QColor("#1f1f23")
+    dark_color = QtGui.QColor("#f5f5f8")
+    return icon_choice.colored(light_color, dark_color).qicon()
+
+
+THEME_SETTINGS_KEY = "ui/themeMode"
+DEFAULT_THEME_MODE = "system"
+THEME_LABELS = {
+    "system": "System (Auto)",
+    "light": "Light",
+    "dark": "Dark",
+}
+THEME_MAP = {
+    "system": Theme.AUTO,
+    "light": Theme.LIGHT,
+    "dark": Theme.DARK,
+}
 
 from pdf_bulk_filler.data.loader import DataLoader, DataSample
 from pdf_bulk_filler.mapping.manager import MappingManager, MappingModel
@@ -439,7 +475,9 @@ class MappingTable(QtWidgets.QTableWidget):
             self.setItem(row, 0, QtWidgets.QTableWidgetItem(field))
             self.setItem(row, 1, QtWidgets.QTableWidgetItem(column))
             remove_button = QtWidgets.QToolButton()
-            remove_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogCloseButton))
+            # Improved icon contrast with Fluent icons
+            remove_button.setIcon(get_fluent_icon("DELETE"))
+            remove_button.setIconSize(QtCore.QSize(16, 16))
             remove_button.setToolTip(f"Remove mapping for {field}")
             remove_button.clicked.connect(lambda checked=False, f=field: self.removeRequested.emit(f))
             self.setCellWidget(row, 2, remove_button)
@@ -477,6 +515,14 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("PDF Bulk Filler")
         self.resize(1400, 900)
+        self.setAutoFillBackground(True)
+
+        self._settings = QtCore.QSettings()
+        self._theme_mode = str(self._settings.value(THEME_SETTINGS_KEY, DEFAULT_THEME_MODE))
+        if self._theme_mode not in THEME_MAP:
+            self._theme_mode = DEFAULT_THEME_MODE
+        # Added theme switcher and persistence
+        self._apply_theme(self._theme_mode, save=False, update_actions=False)
 
         self._data_loader = DataLoader()
         self._pdf_engine = PdfEngine()
@@ -544,30 +590,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def _register_actions(self) -> None:
         toolbar = QtWidgets.QToolBar("Main")
         toolbar.setMovable(False)
+        # Improved toolbar icon sizing for visual consistency
+        toolbar.setIconSize(QtCore.QSize(20, 20))
 
         self._import_data_action = QtGui.QAction("Import CSV/Excel", self)
         self._import_data_action.triggered.connect(self._action_import_data)
         self._import_data_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+D"))
-        self._import_data_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton))
+        # Improved icon contrast with Fluent icons
+        self._import_data_action.setIcon(get_fluent_icon("FOLDER"))
 
         self._import_pdf_action = QtGui.QAction("Import PDF", self)
         self._import_pdf_action.triggered.connect(self._action_import_pdf)
         self._import_pdf_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+P"))
-        self._import_pdf_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
+        # Improved icon contrast with Fluent icons
+        self._import_pdf_action.setIcon(get_fluent_icon("DOCUMENT", default=FI.FOLDER))
 
         self._save_mapping_action = QtGui.QAction("Save Mapping", self)
         self._save_mapping_action.triggered.connect(self._action_save_mapping)
         self._save_mapping_action.setShortcut(QtGui.QKeySequence.Save)
-        self._save_mapping_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton))
+        # Improved icon contrast with Fluent icons
+        self._save_mapping_action.setIcon(get_fluent_icon("SAVE"))
 
         self._load_mapping_action = QtGui.QAction("Load Mapping", self)
         self._load_mapping_action.triggered.connect(self._action_load_mapping)
         self._load_mapping_action.setShortcut(QtGui.QKeySequence.Open)
-        self._load_mapping_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton))
+        # Improved icon contrast with Fluent icons
+        self._load_mapping_action.setIcon(get_fluent_icon("FOLDER"))
 
         self._adjust_range_action = QtGui.QAction("Adjust Data Range", self)
         self._adjust_range_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+R"))
-        self._adjust_range_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
+        # Improved icon contrast with Fluent icons
+        self._adjust_range_action.setIcon(get_fluent_icon("SYNC"))
         self._adjust_range_action.triggered.connect(self._action_adjust_data_range)
         self._adjust_range_action.setEnabled(False)
 
@@ -575,12 +628,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._remove_mapping_action.triggered.connect(lambda: self._action_remove_mapping())
         self._remove_mapping_action.setEnabled(False)
         self._remove_mapping_action.setShortcut(QtGui.QKeySequence.Delete)
-        self._remove_mapping_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_TrashIcon))
+        # Improved icon contrast with Fluent icons
+        self._remove_mapping_action.setIcon(get_fluent_icon("DELETE"))
 
         self._generate_action = QtGui.QAction("Generate PDFs", self)
         self._generate_action.triggered.connect(self._action_generate_pdfs)
         self._generate_action.setShortcut(QtGui.QKeySequence("Ctrl+G"))
-        self._generate_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ArrowRight))
+        # Improved icon contrast with Fluent icons
+        self._generate_action.setIcon(get_fluent_icon("PLAY", "ARROW_RIGHT", default=FI.SYNC))
 
         toolbar.addActions(
             [
@@ -609,20 +664,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._zoom_in_action = QtGui.QAction("Zoom In", self)
         self._zoom_in_action.setShortcut(QtGui.QKeySequence.ZoomIn)
         self._zoom_in_action.triggered.connect(self.pdf_viewer.zoom_in)
-        self._zoom_in_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ArrowUp))
+        # Improved icon contrast with Fluent icons
+        self._zoom_in_action.setIcon(get_fluent_icon("ZOOM_IN", "ADD", default=FI.ADD))
 
         self._zoom_out_action = QtGui.QAction("Zoom Out", self)
         self._zoom_out_action.setShortcut(QtGui.QKeySequence.ZoomOut)
         self._zoom_out_action.triggered.connect(self.pdf_viewer.zoom_out)
-        self._zoom_out_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ArrowDown))
+        # Improved icon contrast with Fluent icons
+        self._zoom_out_action.setIcon(get_fluent_icon("ZOOM_OUT", "REMOVE", "SUBTRACT", default=FI.DELETE))
 
         self._zoom_fit_action = QtGui.QAction("Fit Width", self)
         self._zoom_fit_action.triggered.connect(self.pdf_viewer.fit_to_width)
-        self._zoom_fit_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DesktopIcon))
+        # Improved icon contrast with Fluent icons
+        self._zoom_fit_action.setIcon(get_fluent_icon("FIT_PAGE", "SCALE_FILL", "FULL_SCREEN", default=FI.SYNC))
 
         self._zoom_actual_action = QtGui.QAction("Actual Size", self)
         self._zoom_actual_action.triggered.connect(self.pdf_viewer.actual_size)
-        self._zoom_actual_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon))
+        # Improved icon contrast with Fluent icons
+        self._zoom_actual_action.setIcon(get_fluent_icon("ZOOM", "SCALE", "ZOOM_OUT", default=FI.INFO))
 
         self._zoom_actions = [
             self._zoom_out_action,
@@ -663,7 +722,8 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu.addSeparator()
         exit_action = QtGui.QAction("Exit", self)
         exit_action.setShortcut(QtGui.QKeySequence.Quit)
-        exit_action.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogCloseButton))
+        # Improved icon contrast with Fluent icons
+        exit_action.setIcon(get_fluent_icon("DISMISS", "CLOSE", default=FI.DELETE))
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         self._exit_action = exit_action
@@ -674,9 +734,13 @@ class MainWindow(QtWidgets.QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self._toolbar.toggleViewAction())
         view_menu.addAction(self._mapping_dock.toggleViewAction())
+        theme_menu = view_menu.addMenu("Theme")
+        self._create_theme_actions(theme_menu)
 
         help_menu = menu_bar.addMenu("&Help")
         about_action = QtGui.QAction("About", self)
+        # Improved icon contrast with Fluent icons
+        about_action.setIcon(get_fluent_icon("INFO"))
         about_action.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_action)
         self._about_action = about_action
@@ -1174,6 +1238,125 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._state.pdf_template:
             self._state.pdf_template.close()
         super().closeEvent(event)
+
+    # ----- Theme management ----------------------------------------------------
+    def _create_theme_actions(self, menu: QtWidgets.QMenu) -> None:
+        # Added theme switcher and persistence
+        action_group = QtGui.QActionGroup(self)
+        action_group.setExclusive(True)
+        self._theme_actions: dict[str, QtGui.QAction] = {}
+
+        for mode, label in THEME_LABELS.items():
+            action = QtGui.QAction(label, self)
+            action.setCheckable(True)
+            action_group.addAction(action)
+            action.triggered.connect(lambda checked, m=mode: checked and self._apply_theme(m))
+            menu.addAction(action)
+            self._theme_actions[mode] = action
+
+        self._update_theme_action_checks()
+
+    def _apply_theme(self, mode: str, *, save: bool = True, update_actions: bool = True) -> None:
+        # Added theme switcher and persistence
+        if mode not in THEME_MAP:
+            mode = DEFAULT_THEME_MODE
+        setTheme(THEME_MAP[mode])
+        setThemeColor(ThemeColor.PRIMARY.color())
+        # Added theme switcher and persistence
+        self._apply_palette_for_theme(qconfig.theme)
+        self._theme_mode = mode
+        if save:
+            self._settings.setValue(THEME_SETTINGS_KEY, mode)
+        if update_actions:
+            self._update_theme_action_checks()
+
+    def _update_theme_action_checks(self) -> None:
+        if not hasattr(self, "_theme_actions"):
+            return
+        for mode, action in self._theme_actions.items():
+            action.setChecked(mode == self._theme_mode)
+
+    def _apply_palette_for_theme(self, theme: Theme) -> None:
+        """Synchronize the Qt palette with the active Fluent theme."""
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+
+        primary = ThemeColor.PRIMARY.color()
+        app.setStyle("Fusion")
+
+        if theme == Theme.DARK:
+            palette = QtGui.QPalette()
+            base_color = QtGui.QColor("#202020")
+            alt_base = QtGui.QColor("#2a2a2a")
+            text_color = QtGui.QColor("#f0f0f0")
+            disabled_text = QtGui.QColor("#8c8c8c")
+
+            palette.setColor(QtGui.QPalette.Window, base_color)
+            palette.setColor(QtGui.QPalette.Base, QtGui.QColor("#1a1a1a"))
+            palette.setColor(QtGui.QPalette.AlternateBase, alt_base)
+            palette.setColor(QtGui.QPalette.ToolTipBase, alt_base)
+            palette.setColor(QtGui.QPalette.ToolTipText, text_color)
+            palette.setColor(QtGui.QPalette.Text, text_color)
+            palette.setColor(QtGui.QPalette.Button, base_color)
+            palette.setColor(QtGui.QPalette.ButtonText, text_color)
+            palette.setColor(QtGui.QPalette.WindowText, text_color)
+            palette.setColor(QtGui.QPalette.Highlight, primary)
+            palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#ffffff"))
+            palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.WindowText, disabled_text)
+            palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Text, disabled_text)
+            palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, disabled_text)
+            palette.setColor(QtGui.QPalette.Link, primary)
+            palette.setColor(QtGui.QPalette.LinkVisited, primary.darker(110))
+        else:
+            palette = QtGui.QPalette()
+            background = QtGui.QColor("#f4f4f6")
+            base = QtGui.QColor("#ffffff")
+            alt_base = QtGui.QColor("#f1f1f1")
+            text_color = QtGui.QColor("#1f1f23")
+            disabled_text = QtGui.QColor("#9b9b9f")
+
+            palette.setColor(QtGui.QPalette.Window, background)
+            palette.setColor(QtGui.QPalette.Base, base)
+            palette.setColor(QtGui.QPalette.AlternateBase, alt_base)
+            palette.setColor(QtGui.QPalette.ToolTipBase, base)
+            palette.setColor(QtGui.QPalette.ToolTipText, text_color)
+            palette.setColor(QtGui.QPalette.Text, text_color)
+            palette.setColor(QtGui.QPalette.Button, QtGui.QColor("#efeff1"))
+            palette.setColor(QtGui.QPalette.ButtonText, text_color)
+            palette.setColor(QtGui.QPalette.WindowText, text_color)
+            palette.setColor(QtGui.QPalette.Mid, QtGui.QColor("#d3d3d9"))
+            palette.setColor(QtGui.QPalette.Light, QtGui.QColor("#ffffff"))
+            palette.setColor(QtGui.QPalette.Dark, QtGui.QColor("#b8b8bf"))
+            palette.setColor(QtGui.QPalette.Shadow, QtGui.QColor("#a8a8af"))
+            palette.setColor(QtGui.QPalette.Highlight, primary)
+            palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#ffffff"))
+            palette.setColor(QtGui.QPalette.Link, primary.darker(110))
+            palette.setColor(QtGui.QPalette.LinkVisited, primary.darker(130))
+            palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.WindowText, disabled_text)
+            palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Text, disabled_text)
+            palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, disabled_text)
+
+        app.setPalette(palette)
+        self._repolish_for_theme()
+
+    def _repolish_for_theme(self) -> None:
+        """Force widgets to re-polish so palette changes take effect."""
+        widgets = [
+            self,
+            self.centralWidget(),
+            getattr(self, "spreadsheet_panel", None),
+            getattr(self, "viewer_stack", None),
+            getattr(self, "mapping_table", None),
+        ]
+        for widget in widgets:
+            if widget is None:
+                continue
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            if hasattr(widget, "viewport"):
+                widget.viewport().update()
+            widget.repaint()
 
 
 

@@ -64,6 +64,9 @@ def launch_app(options: argparse.Namespace) -> int:
     app = QtWidgets.QApplication.instance()
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
+    # Added theme switcher and persistence
+    QtCore.QCoreApplication.setOrganizationName("DQP Inc")
+    QtCore.QCoreApplication.setApplicationName("PDF Bulk Filler")
 
     window = MainWindow()
     window.show()
