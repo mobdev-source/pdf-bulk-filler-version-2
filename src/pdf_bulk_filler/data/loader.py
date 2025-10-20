@@ -94,13 +94,17 @@ class DataLoader:
             raise ValueError("Data start row exceeds available rows.")
 
         header_values = frame.iloc[header_idx]
-        cleaned_columns = [self._normalize_column(value) or f"Column {idx + 1}" for idx, value in enumerate(header_values)]
+        cleaned_columns = [
+            self._normalize_column(value) or f"Column {idx + 1}"
+            for idx, value in enumerate(header_values)
+        ]
+        unique_columns = self._deduplicate_columns(cleaned_columns)
 
         frame = frame.iloc[data_idx:]
         if frame.empty:
             raise ValueError("Loaded dataset is empty.")
         frame = frame.reset_index(drop=True)
-        frame.columns = cleaned_columns
+        frame.columns = unique_columns
 
         return DataSample(
             source_path=normalized,
@@ -117,6 +121,20 @@ class DataLoader:
         """Trim whitespace and collapse repeated spaces in column names."""
         collapsed = " ".join(str(column).split())
         return collapsed.strip()
+
+    @staticmethod
+    def _deduplicate_columns(columns: list[str]) -> list[str]:
+        """Append numeric suffixes when column names repeat."""
+        seen: dict[str, int] = {}
+        unique: list[str] = []
+        for name in columns:
+            count = seen.get(name, 0)
+            seen[name] = count + 1
+            if count == 0:
+                unique.append(name)
+            else:
+                unique.append(f"{name} ({count + 1})")
+        return unique
 
     @classmethod
     def supported_filters(cls) -> Iterable[str]:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
 
 import pandas as pd
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 import fitz
 
@@ -74,6 +75,7 @@ class ColumnListWidget(QtWidgets.QListWidget):
         return mime
 
 
+
 class SpreadsheetPanel(QtWidgets.QWidget):
     """Left panel showing preview of the tabular dataset."""
 
@@ -90,13 +92,19 @@ class SpreadsheetPanel(QtWidgets.QWidget):
         size_policy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
         self.setSizePolicy(size_policy)
 
-        header_layout = QtWidgets.QHBoxLayout()
-        header_layout.addWidget(QtWidgets.QLabel("Columns"))
-        header_layout.addStretch()
+        summary_layout = QtWidgets.QHBoxLayout()
+        summary_layout.addStretch()
         self.data_summary_label = QtWidgets.QLabel("No dataset loaded")
         self.data_summary_label.setObjectName("dataSummaryLabel")
         self.data_summary_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        header_layout.addWidget(self.data_summary_label)
+        summary_layout.addWidget(self.data_summary_label)
+
+        column_container = QtWidgets.QWidget()
+        column_layout = QtWidgets.QVBoxLayout(column_container)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(4)
+        column_layout.addWidget(QtWidgets.QLabel("Columns"))
+        column_layout.addWidget(self.columns_widget)
 
         self.table_model = DataFrameModel()
         self.table_view = QtWidgets.QTableView()
@@ -106,10 +114,21 @@ class SpreadsheetPanel(QtWidgets.QWidget):
         self.table_view.horizontalHeader().setStretchLastSection(True)
         self.table_view.verticalHeader().setVisible(False)
 
-        layout.addLayout(header_layout)
-        layout.addWidget(self.columns_widget)
-        layout.addWidget(QtWidgets.QLabel("Sample Rows"))
-        layout.addWidget(self.table_view, stretch=1)
+        table_container = QtWidgets.QWidget()
+        table_layout = QtWidgets.QVBoxLayout(table_container)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(4)
+        table_layout.addWidget(QtWidgets.QLabel("Sample Rows"))
+        table_layout.addWidget(self.table_view)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        splitter.addWidget(column_container)
+        splitter.addWidget(table_container)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        layout.addLayout(summary_layout)
+        layout.addWidget(splitter)
 
     def set_data(self, sample: DataSample) -> None:
         self.columns_widget.set_columns(sample.columns())
@@ -123,8 +142,6 @@ class SpreadsheetPanel(QtWidgets.QWidget):
         self.columns_widget.clear()
         self.table_model.update(pd.DataFrame())
         self.data_summary_label.setText("No dataset loaded")
-
-
 
 
 class DataRangeDialog(QtWidgets.QDialog):
@@ -1012,10 +1029,19 @@ class MainWindow(QtWidgets.QMainWindow):
         frame = sample.dataframe
         if column_name not in frame.columns:
             return None
-        value = frame.iloc[0][column_name]
+        matches = np.flatnonzero(frame.columns.to_numpy() == column_name)
+        if len(matches) == 0:
+            return None
+        series = frame.iloc[:, matches[0]]
+        if isinstance(series, pd.DataFrame):
+            series = series.iloc[:, 0]
+        if series.empty:
+            return None
+        value = series.iloc[0]
         if pd.isna(value):
             return ""
         return str(value)
+
 
     def _on_page_selected(self, value: int) -> None:
         if not self._state.pdf_template:
@@ -1148,6 +1174,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._state.pdf_template:
             self._state.pdf_template.close()
         super().closeEvent(event)
+
+
 
 
 

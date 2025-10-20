@@ -76,3 +76,17 @@ def test_load_with_custom_offsets(tmp_path):
     assert sample.data_row == 5
     assert sample.column_offset == 3
     assert list(sample.dataframe["Name"]) == ["Alice", "Bob"]
+
+
+def test_duplicate_headers_get_suffixes(tmp_path):
+    csv_path = tmp_path / "dupe_headers.csv"
+    csv_path.write_text(
+        "Name,Name,Name\nAlice,Alicia,Aly\nBob,Robert,Rob\n",
+        encoding="utf-8",
+    )
+
+    loader = DataLoader()
+    sample = loader.load(csv_path)
+
+    assert sample.columns() == ["Name", "Name (2)", "Name (3)"]
+    assert list(sample.dataframe["Name (2)"]) == ["Alicia", "Robert"]
