@@ -1,0 +1,5 @@
+ContactID,FullName,Email,AmountDue
+1001,Alice Example,alice@example.com,42.50
+1002,Bob Example,bob@example.com,98.75
+1003,Charlie Example,charlie@example.com,15.00
+
