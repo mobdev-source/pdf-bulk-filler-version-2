@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Iterable, List
 
 from PySide6 import QtCore
 
 from pdf_bulk_filler.pdf.engine import PdfEngine, PdfTemplate
+from pdf_bulk_filler.mapping.rules import coerce_rules
 
 
 class PdfGenerationWorker(QtCore.QObject):
@@ -23,10 +24,11 @@ class PdfGenerationWorker(QtCore.QObject):
         engine: PdfEngine,
         template_path: Path,
         output_dir: Path,
-        assignments: Dict[str, str],
+        rule_spec: object,
         rows: Iterable[Dict[str, object]],
         *,
-        flatten: bool = True,
+        flatten: bool = False,
+        read_only: bool = False,
         template_metadata: PdfTemplate | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
@@ -34,9 +36,10 @@ class PdfGenerationWorker(QtCore.QObject):
         self._engine = engine
         self._template_path = template_path
         self._output_dir = output_dir
-        self._assignments = dict(assignments)
+        self._rules = coerce_rules(rule_spec)
         self._rows = list(rows)
         self._flatten = flatten
+        self._read_only = read_only
         self._template_metadata = template_metadata
         self._cancel_requested = False
 
@@ -46,12 +49,13 @@ class PdfGenerationWorker(QtCore.QObject):
             outputs = self._engine.fill_rows(
                 self._template_path,
                 self._output_dir,
-                self._assignments,
+                self._rules,
                 self._rows,
                 filename_pattern="{index:05d}",
                 progress_callback=self._report_progress,
                 flatten=self._flatten,
                 template_metadata=self._template_metadata,
+                read_only=self._read_only,
             )
         except KeyboardInterrupt:
             self.cancelled.emit()

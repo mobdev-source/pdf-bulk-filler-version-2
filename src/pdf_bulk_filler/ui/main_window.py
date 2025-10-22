@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
 
 import pandas as pd
-import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 import fitz
 from qfluentwidgets import (
@@ -49,7 +48,9 @@ THEME_MAP = {
 
 from pdf_bulk_filler.data.loader import DataLoader, DataSample
 from pdf_bulk_filler.mapping.manager import MappingManager, MappingModel
+from pdf_bulk_filler.mapping.rules import MappingRule, evaluate_rules
 from pdf_bulk_filler.pdf.engine import PdfEngine, PdfField, PdfTemplate
+from pdf_bulk_filler.ui.rule_editor import RuleEditorDialog
 from pdf_bulk_filler.ui.workers import PdfGenerationWorker
 
 
@@ -359,6 +360,12 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
         else:
             self._assignments.pop(field_name, None)
 
+    def clear_assignments(self) -> None:
+        """Remove all visual assignment markers from the viewer."""
+        for field_name in list(self._assignments.keys()):
+            self.set_assignment(field_name, None, None)
+        self._assignments.clear()
+
     def set_page(self, page_index: int) -> None:
         if self._template is None:
             return
@@ -455,32 +462,68 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
 class MappingTable(QtWidgets.QTableWidget):
     """Tabular display of current mappings."""
 
+    editRequested = QtCore.Signal(str)
     removeRequested = QtCore.Signal(str)
 
     def __init__(self) -> None:
-        super().__init__(0, 3)
-        self.setHorizontalHeaderLabels(["Field", "Column", ""])
+        super().__init__(0, 5)
+        self.setHorizontalHeaderLabels(["Rule", "Targets", "Summary", "Preview", "Actions"])
         header = self.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
         self.verticalHeader().setVisible(False)
         self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.setAlternatingRowColors(True)
 
-    def update_mapping(self, assignments: Dict[str, str]) -> None:
+    def update_mapping(
+        self,
+        assignments: Dict[str, MappingRule],
+        previews: Dict[str, str] | None = None,
+    ) -> None:
+        previews = previews or {}
         self.setRowCount(len(assignments))
-        for row, (field, column) in enumerate(sorted(assignments.items())):
-            self.setItem(row, 0, QtWidgets.QTableWidgetItem(field))
-            self.setItem(row, 1, QtWidgets.QTableWidgetItem(column))
+        for row, (field, rule) in enumerate(sorted(assignments.items(), key=lambda item: item[0])):
+            field_item = QtWidgets.QTableWidgetItem(field)
+            field_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+            targets_item = QtWidgets.QTableWidgetItem(", ".join(rule.targets))
+            targets_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+            summary_item = QtWidgets.QTableWidgetItem(rule.describe())
+            summary_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+            preview_text = previews.get(field, "")
+            preview_item = QtWidgets.QTableWidgetItem(preview_text)
+            preview_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+
+            self.setItem(row, 0, field_item)
+            self.setItem(row, 1, targets_item)
+            self.setItem(row, 2, summary_item)
+            self.setItem(row, 3, preview_item)
+
+            action_widget = QtWidgets.QWidget()
+            action_layout = QtWidgets.QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(0, 0, 0, 0)
+            action_layout.setSpacing(4)
+
+            edit_button = QtWidgets.QToolButton()
+            edit_button.setIcon(get_fluent_icon("EDIT"))
+            edit_button.setIconSize(QtCore.QSize(16, 16))
+            edit_button.setToolTip(f"Edit rule for {field}")
+            edit_button.clicked.connect(lambda checked=False, f=field: self.editRequested.emit(f))
+
             remove_button = QtWidgets.QToolButton()
-            # Improved icon contrast with Fluent icons
             remove_button.setIcon(get_fluent_icon("DELETE"))
             remove_button.setIconSize(QtCore.QSize(16, 16))
             remove_button.setToolTip(f"Remove mapping for {field}")
             remove_button.clicked.connect(lambda checked=False, f=field: self.removeRequested.emit(f))
-            self.setCellWidget(row, 2, remove_button)
+
+            action_layout.addWidget(edit_button)
+            action_layout.addWidget(remove_button)
+            action_layout.addStretch(1)
+            self.setCellWidget(row, 4, action_widget)
 
     def selected_field(self) -> Optional[str]:
         row = self.currentRow()
@@ -496,7 +539,19 @@ class MappingTable(QtWidgets.QTableWidget):
                 self.removeRequested.emit(field)
             event.accept()
             return
+        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            field = self.selected_field()
+            if field:
+                self.editRequested.emit(field)
+            event.accept()
+            return
         super().keyPressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        super().mouseDoubleClickEvent(event)
+        field = self.selected_field()
+        if field:
+            self.editRequested.emit(field)
 
 
 @dataclass
@@ -562,6 +617,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splitter = splitter
 
         self.mapping_table = MappingTable()
+        self.mapping_table.editRequested.connect(lambda field: self._action_edit_mapping(field))
         self.mapping_table.removeRequested.connect(lambda field: self._action_remove_mapping(field))
         self.mapping_table.itemSelectionChanged.connect(self._update_mapping_action_state)
         self._mapping_dock = QtWidgets.QDockWidget("Mappings", self)
@@ -583,6 +639,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._configure_page_controls_for_template()
         self._zoom_label = QtWidgets.QLabel("100%")
         self.statusBar().addPermanentWidget(self._zoom_label)
+        self._read_only_output = False
+        self._output_mode_label = QtWidgets.QLabel("Output Mode: Editable (fillable)")
+        self.statusBar().addPermanentWidget(self._output_mode_label)
         self._on_zoom_changed(self.pdf_viewer.current_zoom())
         self._set_status("Load data and a PDF template to begin")
 
@@ -624,6 +683,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self._adjust_range_action.triggered.connect(self._action_adjust_data_range)
         self._adjust_range_action.setEnabled(False)
 
+        self._output_mode_group = QtGui.QActionGroup(self)
+        self._output_mode_group.setExclusive(True)
+
+        self._output_mode_editable_action = QtGui.QAction("Editable Output (fillable)", self)
+        self._output_mode_editable_action.setCheckable(True)
+        self._output_mode_group.addAction(self._output_mode_editable_action)
+        self._output_mode_editable_action.toggled.connect(
+            lambda checked: checked and self._set_output_mode(editable=True, announce=True)
+        )
+
+        self._output_mode_readonly_action = QtGui.QAction("Read-Only Output (locked)", self)
+        self._output_mode_readonly_action.setCheckable(True)
+        self._output_mode_group.addAction(self._output_mode_readonly_action)
+        self._output_mode_readonly_action.toggled.connect(
+            lambda checked: checked and self._set_output_mode(editable=False, announce=True)
+        )
+
+        self._output_mode_widget = QtWidgets.QWidget()
+        mode_layout = QtWidgets.QHBoxLayout(self._output_mode_widget)
+        mode_layout.setContentsMargins(6, 0, 6, 0)
+        mode_layout.setSpacing(8)
+        mode_layout.addWidget(QtWidgets.QLabel("Output:"))
+        self._editable_radio = QtWidgets.QRadioButton("Editable")
+        self._editable_radio.setToolTip("Generate PDFs that remain fillable.")
+        self._editable_radio.toggled.connect(
+            lambda checked: checked and self._set_output_mode(editable=True, announce=True)
+        )
+        mode_layout.addWidget(self._editable_radio)
+        self._readonly_radio = QtWidgets.QRadioButton("Read-Only")
+        self._readonly_radio.setToolTip("Generate PDFs with fields locked (read-only) without flattening.")
+        self._readonly_radio.toggled.connect(
+            lambda checked: checked and self._set_output_mode(editable=False, announce=True)
+        )
+        mode_layout.addWidget(self._readonly_radio)
+        mode_layout.addStretch(1)
+        self._output_mode_widget_action = QtWidgets.QWidgetAction(self)
+        self._output_mode_widget_action.setDefaultWidget(self._output_mode_widget)
+
+        self._edit_mapping_action = QtGui.QAction("Edit Mapping", self)
+        self._edit_mapping_action.triggered.connect(lambda: self._action_edit_mapping())
+        self._edit_mapping_action.setEnabled(False)
+        self._edit_mapping_action.setShortcut(QtGui.QKeySequence("Ctrl+E"))
+        self._edit_mapping_action.setIcon(get_fluent_icon("EDIT"))
+
         self._remove_mapping_action = QtGui.QAction("Remove Mapping", self)
         self._remove_mapping_action.triggered.connect(lambda: self._action_remove_mapping())
         self._remove_mapping_action.setEnabled(False)
@@ -644,10 +747,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._save_mapping_action,
                 self._load_mapping_action,
                 self._adjust_range_action,
+                self._edit_mapping_action,
                 self._remove_mapping_action,
                 self._generate_action,
             ]
         )
+        toolbar.addAction(self._output_mode_widget_action)
 
         toolbar.addSeparator()
         page_label = QtWidgets.QLabel("Page")
@@ -702,6 +807,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for action in (*self._zoom_actions,):
             self.addAction(action)
 
+        self._set_output_mode(editable=True, announce=False)
+
         self.addToolBar(toolbar)
         self._toolbar = toolbar
         self._update_zoom_action_state()
@@ -717,6 +824,11 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu.addAction(self._save_mapping_action)
         file_menu.addAction(self._load_mapping_action)
         file_menu.addAction(self._adjust_range_action)
+        output_menu = file_menu.addMenu("Output Mode")
+        output_menu.addAction(self._output_mode_editable_action)
+        output_menu.addAction(self._output_mode_readonly_action)
+        file_menu.addAction(self._edit_mapping_action)
+        file_menu.addAction(self._remove_mapping_action)
         file_menu.addSeparator()
         file_menu.addAction(self._generate_action)
         file_menu.addSeparator()
@@ -836,7 +948,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._configure_page_controls_for_template()
 
     def _action_save_mapping(self) -> None:
-        if not self._state.mapping.assignments:
+        if not self._state.mapping.rules:
             QtWidgets.QMessageBox.information(self, "No Mappings", "Create at least one mapping first.")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -940,7 +1052,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self._set_status("Cannot generate PDFs without data and template", timeout=5000)
             return
-        if not self._state.mapping.assignments:
+        if not self._state.mapping.rules:
             QtWidgets.QMessageBox.warning(self, "Missing Mapping", "Map at least one field first.")
             self._set_status("Create at least one mapping before generating PDFs", timeout=5000)
             return
@@ -965,7 +1077,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_status("Data source contains no rows", timeout=4000)
             return
 
-        self._set_status(f"Generating PDFs into '{Path(destination).name}'")
+        read_only_choice = getattr(self, "_read_only_output", False)
+        mode_suffix = " (read-only)" if read_only_choice else " (editable)"
+        self._set_status(f"Generating PDFs into '{Path(destination).name}'{mode_suffix}")
         progress = QtWidgets.QProgressDialog(
             "Generating PDFs...", "Cancel", 0, len(rows), self, QtCore.Qt.WindowTitleHint
         )
@@ -976,9 +1090,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pdf_engine,
             self._state.pdf_template.path,
             Path(destination),
-            dict(self._state.mapping.assignments),
+            list(self._state.mapping.iter_rules()),
             rows,
-            flatten=True,
+            flatten=False,
+            read_only=read_only_choice,
             template_metadata=None,
         )
         thread = QtCore.QThread(self)
@@ -1006,11 +1121,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_mapping_labels()
 
     def _refresh_mapping_labels(self) -> None:
-        self.mapping_table.update_mapping(self._state.mapping.assignments)
-        for field_name, column in self._state.mapping.assignments.items():
-            preview = self._preview_value_for_column(column)
-            self.pdf_viewer.set_assignment(field_name, column, preview)
+        rules = self._state.mapping.rules
+        sample_row = self._current_sample_row()
+        sample_payload: Dict[str, str] = {}
+        if sample_row:
+            sample_payload = evaluate_rules(rules.values(), sample_row)
+
+        previews: Dict[str, str] = {}
+        for field_name, rule in rules.items():
+            previews[field_name] = self._format_rule_preview(rule, sample_payload)
+
+        self.mapping_table.update_mapping(rules, previews)
+        self.pdf_viewer.clear_assignments()
+        for _, rule in sorted(rules.items(), key=lambda item: item[0]):
+            descriptor = rule.describe()
+            for target in rule.targets:
+                preview_value = sample_payload.get(target, "")
+                self.pdf_viewer.set_assignment(target, descriptor, preview_value)
         self._update_mapping_action_state()
+
+    def _current_sample_row(self) -> Optional[Dict[str, object]]:
+        if not self._state.data_sample:
+            return None
+        frame = self._state.data_sample.dataframe
+        if frame.empty:
+            return None
+        return frame.iloc[0].to_dict()
+
+    def _format_rule_preview(self, rule: MappingRule, payload: Dict[str, str]) -> str:
+        if not payload:
+            return ""
+        values = []
+        for target in rule.targets:
+            value = payload.get(target, "")
+            if value:
+                values.append(f"{target}: {value}")
+        if values:
+            if len(rule.targets) == 1:
+                return values[0].split(": ", 1)[-1]
+            return "; ".join(values)
+        for target in rule.targets:
+            if target in payload:
+                return payload.get(target, "") or ""
+        return ""
 
     def _show_pdf_viewer(self) -> None:
         self.viewer_stack.setCurrentWidget(self.pdf_viewer)
@@ -1086,27 +1239,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return self._prompt_data_range(path, sample)
         return sample
 
-    def _preview_value_for_column(self, column_name: str) -> Optional[str]:
-        sample = self._state.data_sample
-        if not sample or sample.dataframe.empty:
-            return None
-        frame = sample.dataframe
-        if column_name not in frame.columns:
-            return None
-        matches = np.flatnonzero(frame.columns.to_numpy() == column_name)
-        if len(matches) == 0:
-            return None
-        series = frame.iloc[:, matches[0]]
-        if isinstance(series, pd.DataFrame):
-            series = series.iloc[:, 0]
-        if series.empty:
-            return None
-        value = series.iloc[0]
-        if pd.isna(value):
-            return ""
-        return str(value)
-
-
     def _on_page_selected(self, value: int) -> None:
         if not self._state.pdf_template:
             return
@@ -1126,10 +1258,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._zoom_label.setText(f"{int(round(zoom * 100))}%")
 
     def _update_mapping_action_state(self) -> None:
+        selected = self.mapping_table.selected_field()
+        if hasattr(self, "_edit_mapping_action"):
+            self._edit_mapping_action.setEnabled(selected is not None)
         if hasattr(self, "_remove_mapping_action"):
-            self._remove_mapping_action.setEnabled(
-                self.mapping_table.selected_field() is not None
-            )
+            self._remove_mapping_action.setEnabled(selected is not None)
         self._update_data_actions()
         self._update_zoom_action_state()
 
@@ -1146,6 +1279,52 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "_adjust_range_action"):
             self._adjust_range_action.setEnabled(self._state.data_sample is not None)
 
+    def _set_output_mode(self, *, editable: bool, announce: bool = False) -> None:
+        self._read_only_output = not editable
+
+        if hasattr(self, "_editable_radio"):
+            self._editable_radio.blockSignals(True)
+            self._editable_radio.setChecked(editable)
+            self._editable_radio.blockSignals(False)
+        if hasattr(self, "_readonly_radio"):
+            self._readonly_radio.blockSignals(True)
+            self._readonly_radio.setChecked(not editable)
+            self._readonly_radio.blockSignals(False)
+        if hasattr(self, "_output_mode_editable_action"):
+            self._output_mode_editable_action.blockSignals(True)
+            self._output_mode_editable_action.setChecked(editable)
+            self._output_mode_editable_action.blockSignals(False)
+        if hasattr(self, "_output_mode_readonly_action"):
+            self._output_mode_readonly_action.blockSignals(True)
+            self._output_mode_readonly_action.setChecked(not editable)
+            self._output_mode_readonly_action.blockSignals(False)
+
+        self._update_output_mode_label(editable)
+
+        if announce:
+            mode_text = (
+                "Output mode set to: Editable (fillable PDFs)"
+                if editable
+                else "Output mode set to: Read-Only (fields locked)"
+            )
+            self._set_status(mode_text, timeout=5000)
+
+    def _update_output_mode_label(self, editable: bool) -> None:
+        if not hasattr(self, "_output_mode_label"):
+            return
+        text = (
+            "Output Mode: Editable (fillable)"
+            if editable
+            else "Output Mode: Read-Only (locked)"
+        )
+        self._output_mode_label.setText(text)
+        palette = self._output_mode_label.palette()
+        palette.setColor(
+            QtGui.QPalette.WindowText,
+            QtGui.QColor("#2f7d3b") if editable else QtGui.QColor("#a83232"),
+        )
+        self._output_mode_label.setPalette(palette)
+
     def _show_about_dialog(self) -> None:
         QtWidgets.QMessageBox.about(
             self,
@@ -1158,13 +1337,35 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
 
+    def _action_edit_mapping(self, field_name: Optional[str] = None) -> None:
+        field = field_name or self.mapping_table.selected_field()
+        if not field:
+            return
+        if not self._state.pdf_template:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No PDF Template",
+                "Load a PDF template before editing mapping rules.",
+            )
+            return
+        available_fields = sorted({f.field_name for f in self._state.pdf_template.fields})
+        available_columns: list[str] = []
+        if self._state.data_sample is not None:
+            available_columns = list(self._state.data_sample.columns())
+        rule = self._state.mapping.resolve(field)
+        dialog = RuleEditorDialog(field, rule, available_fields, available_columns, self)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            updated_rule = dialog.selected_rule()
+            self._state.mapping.assign(field, updated_rule)
+            self._refresh_mapping_labels()
+            self._set_status(f"Updated mapping rule for '{field}'", timeout=4000)
+
     def _action_remove_mapping(self, field_name: Optional[str] = None) -> None:
         field = field_name or self.mapping_table.selected_field()
         if not field:
             return
-        if field in self._state.mapping.assignments:
+        if field in self._state.mapping.rules:
             self._state.mapping.remove(field)
-            self.pdf_viewer.set_assignment(field, None)
             self._refresh_mapping_labels()
             self._update_data_actions()
             self._set_status(f"Removed mapping for '{field}'", timeout=4000)

@@ -11,8 +11,9 @@ def test_mapping_roundtrip(tmp_path):
         header_row=4,
         data_row=5,
         column_offset=3,
-        assignments={"FieldA": "column_a", "FieldB": "column_b"},
     )
+    mapping.assign("FieldA", "column_a")
+    mapping.assign("FieldB", "column_b")
     manager = MappingManager()
 
     destination = tmp_path / "mapping.json"
@@ -25,4 +26,4 @@ def test_mapping_roundtrip(tmp_path):
     assert loaded.header_row == mapping.header_row
     assert loaded.data_row == mapping.data_row
     assert loaded.column_offset == mapping.column_offset
-    assert loaded.assignments == mapping.assignments
+    assert loaded.to_legacy_fields() == mapping.to_legacy_fields()
