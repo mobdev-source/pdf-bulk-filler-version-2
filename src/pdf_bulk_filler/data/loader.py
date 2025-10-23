@@ -140,9 +140,9 @@ class DataLoader:
     def supported_filters(cls) -> Iterable[str]:
         """Return file dialog filters for supported formats."""
         return (
+            "All Supported (*.csv *.tsv *.xls *.xlsx)",
             "CSV Files (*.csv)",
             "Excel Files (*.xls *.xlsx)",
             "Delimited Text (*.tsv)",
-            "All Supported (*.csv *.tsv *.xls *.xlsx)",
         )
 

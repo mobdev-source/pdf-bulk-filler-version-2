@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import io
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 import fitz  # PyMuPDF
 from PyPDF2 import PdfReader, PdfWriter
@@ -74,6 +74,7 @@ class PdfEngine:
         *,
         filename_pattern: str = "{index:05d}_{field}",
         index_field: str = "id",
+        filename_builder: Callable[[Mapping[str, Any], int], str] | None = None,
         progress_callback: callable | None = None,
         flatten: bool = False,
         template_metadata: Optional[PdfTemplate] = None,
@@ -110,8 +111,18 @@ class PdfEngine:
             payload = evaluate_rules(rules, row_mapping)
 
             label_value = row_mapping.get(index_field) or index
-            filename = filename_pattern.format(index=index, field=label_value)
-            output_path = destination_dir / f"{filename}.pdf"
+            filename_value: str = ""
+            if filename_builder is not None:
+                try:
+                    filename_value = str(filename_builder(row_mapping, index)).strip()
+                except Exception:
+                    filename_value = ""
+            if not filename_value:
+                filename_value = str(filename_pattern.format(index=index, field=label_value))
+            sanitized = filename_value.replace("/", "_").replace("\\", "_").strip()
+            if not sanitized:
+                sanitized = f"{index:05d}"
+            output_path = destination_dir / f"{sanitized}.pdf"
 
             if flatten:
                 self._write_flattened_pdf(

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 import pandas as pd
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -52,6 +53,110 @@ from pdf_bulk_filler.mapping.rules import MappingRule, evaluate_rules
 from pdf_bulk_filler.pdf.engine import PdfEngine, PdfField, PdfTemplate
 from pdf_bulk_filler.ui.rule_editor import RuleEditorDialog
 from pdf_bulk_filler.ui.workers import PdfGenerationWorker
+
+_FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+_FILENAME_WHITESPACE_PATTERN = re.compile(r"\s+")
+_MAX_FILENAME_LENGTH = 120
+GENERATION_MODE_KEY = "generation/mode"
+GENERATION_DIR_KEY = "generation/directory"
+GENERATION_FILE_KEY = "generation/file"
+GENERATION_COLUMNS_KEY = "generation/columns"
+GENERATION_PREFIX_KEY = "generation/prefix"
+GENERATION_SUFFIX_KEY = "generation/suffix"
+GENERATION_SEPARATOR_KEY = "generation/separator"
+GENERATION_READ_ONLY_KEY = "generation/read_only"
+
+
+def _sanitize_filename_token(value: object) -> str:
+    """Return a filesystem-safe token derived from ``value``."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = _FILENAME_WHITESPACE_PATTERN.sub("_", text)
+    text = _FILENAME_SANITIZE_PATTERN.sub("_", text)
+    return text.strip("_")[:_MAX_FILENAME_LENGTH]
+
+
+@dataclass
+class GenerationOptions:
+    """User selections for PDF generation."""
+
+    mode: str  # "per_entry" or "combined"
+    destination_dir: Path | None
+    combined_path: Path | None
+    columns: list[str]
+    prefix: str
+    suffix: str
+    separator: str
+    read_only: bool
+
+
+class FilenameBuilder:
+    """Callable responsible for generating unique filenames per row."""
+
+    def __init__(
+        self,
+        columns: Sequence[str],
+        *,
+        prefix: str = "",
+        suffix: str = "",
+        separator: str = "_",
+        index_field: str = "id",
+    ) -> None:
+        self._columns = list(columns)
+        self._prefix = prefix.strip()
+        self._suffix = suffix.strip()
+        self._separator = separator or "_"
+        self._index_field = index_field
+        self._counts: Dict[str, int] = {}
+
+    def __call__(self, row: Mapping[str, Any], index: int) -> str:
+        base = self._compose_base(row, index)
+        normalized = base or f"{index:05d}"
+        normalized = normalized[:_MAX_FILENAME_LENGTH]
+
+        count = self._counts.get(normalized, 0)
+        self._counts[normalized] = count + 1
+        if count:
+            suffix = f"{self._separator or '_'}{count+1:02d}"
+            available = max(1, _MAX_FILENAME_LENGTH - len(suffix))
+            trimmed = normalized[:available].rstrip("_-. ")
+            normalized = f"{trimmed}{suffix}"
+        return normalized or f"{index:05d}"
+
+    def preview(self, row: Mapping[str, Any], index: int = 1) -> str:
+        """Return a sample filename without mutating internal state."""
+        temp = FilenameBuilder(
+            self._columns,
+            prefix=self._prefix,
+            suffix=self._suffix,
+            separator=self._separator,
+            index_field=self._index_field,
+        )
+        return temp(row, index)
+
+    def _compose_base(self, row: Mapping[str, Any], index: int) -> str:
+        tokens: list[str] = []
+        if self._prefix:
+            tokens.append(_sanitize_filename_token(self._prefix))
+        for column in self._columns:
+            value = row.get(column)
+            token = _sanitize_filename_token(value)
+            if token:
+                tokens.append(token)
+        if self._suffix:
+            tokens.append(_sanitize_filename_token(self._suffix))
+
+        if not tokens:
+            fallback = row.get(self._index_field) if isinstance(row, Mapping) else None
+            token = _sanitize_filename_token(fallback) or f"{index:05d}"
+            tokens.append(token)
+
+        separator = self._separator if self._separator is not None else "_"
+        joined = separator.join(token for token in tokens if token)
+        return joined.strip("_-. ")
 
 
 class DataFrameModel(QtCore.QAbstractTableModel):
@@ -242,6 +347,259 @@ class DataRangeDialog(QtWidgets.QDialog):
         )
 
 
+class GeneratePdfDialog(QtWidgets.QDialog):
+    """Prompt the user for PDF generation options."""
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        *,
+        columns: Sequence[str],
+        sample_row: Mapping[str, Any] | None,
+        default_mode: str = "per_entry",
+        default_directory: Path | None = None,
+        default_file: Path | None = None,
+        default_columns: Sequence[str] | None = None,
+        default_prefix: str = "",
+        default_suffix: str = "",
+        default_separator: str = "_",
+        default_read_only: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Generate PDFs")
+        self.setModal(True)
+        self.resize(520, 520)
+
+        self._all_columns = list(columns)
+        self._sample_row = sample_row or {}
+        self._default_mode = default_mode if default_mode in {"per_entry", "combined"} else "per_entry"
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        mode_group = QtWidgets.QGroupBox("Output Type")
+        mode_layout = QtWidgets.QHBoxLayout(mode_group)
+        self._per_entry_radio = QtWidgets.QRadioButton("One PDF per data row")
+        self._combined_radio = QtWidgets.QRadioButton("Single combined PDF")
+        mode_layout.addWidget(self._per_entry_radio)
+        mode_layout.addWidget(self._combined_radio)
+        mode_layout.addStretch(1)
+        layout.addWidget(mode_group)
+
+        self._stack = QtWidgets.QStackedWidget()
+        layout.addWidget(self._stack)
+
+        # --- Per-entry widget
+        per_entry_widget = QtWidgets.QWidget()
+        per_layout = QtWidgets.QVBoxLayout(per_entry_widget)
+        per_layout.setSpacing(10)
+
+        dir_layout = QtWidgets.QHBoxLayout()
+        dir_layout.addWidget(QtWidgets.QLabel("Destination folder:"))
+        self._directory_edit = QtWidgets.QLineEdit()
+        self._directory_edit.setReadOnly(True)
+        if default_directory:
+            self._directory_edit.setText(str(default_directory))
+        dir_layout.addWidget(self._directory_edit, 1)
+        browse_dir_button = QtWidgets.QToolButton()
+        browse_dir_button.setText("Browse…")
+        browse_dir_button.clicked.connect(self._choose_directory)
+        dir_layout.addWidget(browse_dir_button)
+        per_layout.addLayout(dir_layout)
+
+        column_group = QtWidgets.QGroupBox("Filename columns")
+        column_group.setToolTip("Select columns whose values should appear in each PDF filename.")
+        column_layout = QtWidgets.QVBoxLayout(column_group)
+        self._column_list = QtWidgets.QListWidget()
+        self._column_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        column_layout.addWidget(self._column_list)
+        per_layout.addWidget(column_group)
+
+        options_layout = QtWidgets.QGridLayout()
+        options_layout.addWidget(QtWidgets.QLabel("Prefix:"), 0, 0)
+        self._prefix_edit = QtWidgets.QLineEdit(default_prefix)
+        options_layout.addWidget(self._prefix_edit, 0, 1)
+
+        options_layout.addWidget(QtWidgets.QLabel("Suffix:"), 1, 0)
+        self._suffix_edit = QtWidgets.QLineEdit(default_suffix)
+        options_layout.addWidget(self._suffix_edit, 1, 1)
+
+        options_layout.addWidget(QtWidgets.QLabel("Separator:"), 2, 0)
+        self._separator_edit = QtWidgets.QLineEdit(default_separator or "_")
+        self._separator_edit.setMaxLength(4)
+        options_layout.addWidget(self._separator_edit, 2, 1)
+        per_layout.addLayout(options_layout)
+
+        self._filename_preview = QtWidgets.QLabel("")
+        self._filename_preview.setObjectName("filenamePreviewLabel")
+        per_layout.addWidget(self._filename_preview)
+
+        per_layout.addStretch(1)
+        self._stack.addWidget(per_entry_widget)
+
+        # --- Combined widget
+        combined_widget = QtWidgets.QWidget()
+        combined_layout = QtWidgets.QFormLayout(combined_widget)
+        self._combined_path_edit = QtWidgets.QLineEdit()
+        if default_file:
+            self._combined_path_edit.setText(str(default_file))
+        combined_browse = QtWidgets.QToolButton()
+        combined_browse.setText("Browse…")
+        combined_browse.clicked.connect(self._choose_combined_path)
+
+        file_layout = QtWidgets.QHBoxLayout()
+        file_layout.addWidget(self._combined_path_edit, 1)
+        file_layout.addWidget(combined_browse)
+        combined_layout.addRow("Output file:", file_layout)
+        note = QtWidgets.QLabel("The generated PDFs will be merged into a single document.")
+        note.setWordWrap(True)
+        combined_layout.addRow(note)
+        combined_layout.addItem(QtWidgets.QSpacerItem(10, 10, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding))
+        self._stack.addWidget(combined_widget)
+
+        # --- Output behavior
+        behavior_group = QtWidgets.QGroupBox("PDF behavior")
+        behavior_layout = QtWidgets.QHBoxLayout(behavior_group)
+        self._editable_radio = QtWidgets.QRadioButton("Editable (fillable)")
+        self._readonly_radio = QtWidgets.QRadioButton("Read-only (locked)")
+        behavior_layout.addWidget(self._editable_radio)
+        behavior_layout.addWidget(self._readonly_radio)
+        behavior_layout.addStretch(1)
+        layout.addWidget(behavior_group)
+
+        # Buttons
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        layout.addWidget(buttons)
+
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        # Populate columns list
+        for column in self._all_columns:
+            item = QtWidgets.QListWidgetItem(column)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Unchecked)
+            self._column_list.addItem(item)
+
+        if default_columns:
+            default_set = {col for col in default_columns}
+            for index in range(self._column_list.count()):
+                item = self._column_list.item(index)
+                if item.text() in default_set:
+                    item.setCheckState(QtCore.Qt.Checked)
+
+        self._per_entry_radio.toggled.connect(self._update_mode)
+        self._column_list.itemChanged.connect(self._update_preview)
+        self._prefix_edit.textChanged.connect(self._update_preview)
+        self._suffix_edit.textChanged.connect(self._update_preview)
+        self._separator_edit.textChanged.connect(self._update_preview)
+
+        if default_read_only:
+            self._readonly_radio.setChecked(True)
+        else:
+            self._editable_radio.setChecked(True)
+
+        if self._default_mode == "combined":
+            self._combined_radio.setChecked(True)
+        else:
+            self._per_entry_radio.setChecked(True)
+
+        self._update_mode()
+        self._update_preview()
+
+    def selected_columns(self) -> list[str]:
+        return [
+            self._column_list.item(i).text()
+            for i in range(self._column_list.count())
+            if self._column_list.item(i).checkState() == QtCore.Qt.Checked
+        ]
+
+    def options(self) -> GenerationOptions:
+        mode = "combined" if self._combined_radio.isChecked() else "per_entry"
+        directory = Path(self._directory_edit.text()) if self._directory_edit.text() else None
+        combined_path = (
+            Path(self._combined_path_edit.text()) if self._combined_path_edit.text() else None
+        )
+        separator = self._separator_edit.text() or "_"
+        return GenerationOptions(
+            mode=mode,
+            destination_dir=directory,
+            combined_path=combined_path,
+            columns=self.selected_columns(),
+            prefix=self._prefix_edit.text(),
+            suffix=self._suffix_edit.text(),
+            separator=separator,
+            read_only=self._readonly_radio.isChecked(),
+        )
+
+    def accept(self) -> None:  # noqa: D401
+        """Validate user choices before closing the dialog."""
+        mode = "combined" if self._combined_radio.isChecked() else "per_entry"
+        if mode == "per_entry":
+            directory = self._directory_edit.text()
+            if not directory:
+                QtWidgets.QMessageBox.warning(self, "Missing folder", "Select an output folder.")
+                return
+        else:
+            path_text = self._combined_path_edit.text()
+            if not path_text:
+                QtWidgets.QMessageBox.warning(self, "Missing file", "Choose a combined PDF filename.")
+                return
+            if not path_text.lower().endswith(".pdf"):
+                self._combined_path_edit.setText(f"{path_text}.pdf")
+        super().accept()
+
+    def _choose_directory(self) -> None:
+        current = self._directory_edit.text()
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select output folder", current or ""
+        )
+        if path:
+            self._directory_edit.setText(path)
+            self._update_preview()
+
+    def _choose_combined_path(self) -> None:
+        current = self._combined_path_edit.text()
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save merged PDF",
+            current or "",
+            "PDF Files (*.pdf)",
+        )
+        if path:
+            if not path.lower().endswith(".pdf"):
+                path = f"{path}.pdf"
+            self._combined_path_edit.setText(path)
+
+    def _update_mode(self) -> None:
+        per_entry = self._per_entry_radio.isChecked()
+        self._stack.setCurrentIndex(0 if per_entry else 1)
+        self._stack.setEnabled(True)
+        self._column_list.setEnabled(per_entry)
+        self._prefix_edit.setEnabled(per_entry)
+        self._suffix_edit.setEnabled(per_entry)
+        self._separator_edit.setEnabled(per_entry)
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        if not self._per_entry_radio.isChecked():
+            self._filename_preview.setText("Files will be merged into a single PDF.")
+            return
+        if not self._sample_row:
+            self._filename_preview.setText("Preview unavailable (data sample not loaded).")
+            return
+        builder = FilenameBuilder(
+            self.selected_columns(),
+            prefix=self._prefix_edit.text(),
+            suffix=self._suffix_edit.text(),
+            separator=self._separator_edit.text() or "_",
+        )
+        preview = builder.preview(self._sample_row, 1)
+        self._filename_preview.setText(f"Example filename: {preview}.pdf")
+
+
 class PdfFieldItem(QtWidgets.QGraphicsRectItem):
     """Interactive overlay representing a PDF form field on the canvas."""
 
@@ -258,7 +616,9 @@ class PdfFieldItem(QtWidgets.QGraphicsRectItem):
         self.setPen(QtGui.QPen(QtGui.QColor(0, 120, 215), 1, QtCore.Qt.DashLine))
         self.setZValue(1)
         self.setAcceptDrops(True)
+        self.setAcceptHoverEvents(True)
         self._label: QtWidgets.QGraphicsSimpleTextItem | None = None
+        self._current_column: str | None = None
 
     def dragEnterEvent(self, event: QtWidgets.QGraphicsSceneDragDropEvent) -> None:  # noqa: N802
         if event.mimeData().hasText():
@@ -278,12 +638,11 @@ class PdfFieldItem(QtWidgets.QGraphicsRectItem):
         column_name: Optional[str],
         sample_value: Optional[str] = None,
     ) -> None:
+        self._current_column = column_name
         if column_name:
             self.setToolTip(f"PDF Field: {self.field.field_name}\nColumn: {column_name}")
             self.setBrush(QtGui.QColor(0, 170, 255, 100))
-            label = self._ensure_label()
-            label.setPos(self.rect().left() + 2, self.rect().top() + 2)
-            label.setText((sample_value or "")[:64])
+            self._set_label_text(sample_value or "")
         else:
             self.setToolTip(f"PDF Field: {self.field.field_name}")
             self.setBrush(QtGui.QColor(0, 170, 255, 50))
@@ -300,6 +659,103 @@ class PdfFieldItem(QtWidgets.QGraphicsRectItem):
             font.setPointSize(8)
             self._label.setFont(font)
         return self._label
+    def hoverEnterEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:  # noqa: N802
+        self._show_tooltip(event)
+        super().hoverEnterEvent(event)
+
+    def hoverMoveEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:  # noqa: N802
+        self._show_tooltip(event)
+        super().hoverMoveEvent(event)
+
+    def hoverLeaveEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:  # noqa: N802
+        QtWidgets.QToolTip.hideText()
+        super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:  # noqa: N802
+        self._show_tooltip(event)
+        super().mousePressEvent(event)
+
+    def _show_tooltip(self, event: QtCore.QEvent) -> None:
+        tooltip = self.toolTip() or f"PDF Field: {self.field.field_name}"
+        if isinstance(event, (QtWidgets.QGraphicsSceneHoverEvent, QtWidgets.QGraphicsSceneMouseEvent)):
+            pos = event.screenPos()
+        else:
+            pos = QtGui.QCursor.pos()
+        QtWidgets.QToolTip.showText(
+            QtCore.QPoint(int(pos.x()), int(pos.y())),
+            tooltip,
+            None,
+        )
+
+    def _set_label_text(self, text: str) -> None:
+        label = self._ensure_label()
+        if not text:
+            label.setText("")
+            return
+
+        rect = self.rect()
+        stripped = text.strip()
+        is_checkbox_preview = stripped in {"\u2713", "✓", "✔", "☑"}
+
+        if is_checkbox_preview:
+            base = min(rect.width(), rect.height())
+            preferred = max(8.0, min(base * 0.68, 14.0))
+            font = label.font()
+            font.setPointSizeF(preferred)
+            label.setFont(font)
+
+            metrics = QtGui.QFontMetricsF(font)
+            display = stripped
+            text_width = metrics.horizontalAdvance(display)
+            text_height = metrics.height()
+            x = rect.left() + max(0.0, (rect.width() - text_width) / 2.0)
+            y = rect.top() + max(0.0, (rect.height() - text_height) / 2.0)
+            label.setPos(x, y)
+            label.setText(display)
+            return
+
+        horizontal_padding = max(2.0, min(rect.width() * 0.04, 6.0))
+        vertical_padding = max(2.0, min(rect.height() * 0.2, 6.0))
+        usable_width = max(8.0, rect.width() - (horizontal_padding * 2.0))
+        usable_height = max(7.0, rect.height() - (vertical_padding * 2.0))
+
+        font = label.font()
+        base_size = min(11.0, max(8.0, usable_height * 0.6))
+        font_size = self._calculate_font_size(
+            font,
+            text,
+            usable_width,
+            usable_height,
+            base_size,
+        )
+        font.setPointSizeF(font_size)
+        label.setFont(font)
+
+        metrics = QtGui.QFontMetricsF(font)
+        elided = metrics.elidedText(text, QtCore.Qt.ElideRight, usable_width)
+        label.setPos(rect.left() + horizontal_padding, rect.top() + vertical_padding)
+        label.setText(elided)
+
+    def _calculate_font_size(
+        self,
+        font: QtGui.QFont,
+        text: str,
+        max_width: float,
+        max_height: float,
+        base_size: float,
+    ) -> float:
+        """Return a font size that fits within the provided bounds."""
+        min_size = 6.0
+        size = max(base_size, min_size)
+        font.setPointSizeF(size)
+        metrics = QtGui.QFontMetricsF(font)
+        while size > min_size and (
+            metrics.height() > max_height or metrics.horizontalAdvance(text) > max_width
+        ):
+            size -= 0.5
+            font.setPointSizeF(size)
+            metrics = QtGui.QFontMetricsF(font)
+        return max(size, min_size)
 
 
 class PdfViewerWidget(QtWidgets.QGraphicsView):
@@ -416,6 +872,18 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
         self.scene().setSceneRect(self.scene().itemsBoundingRect())
         self.resetTransform()
         self.centerOn(self.scene().sceneRect().center())
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802
+        if event.modifiers() & QtCore.Qt.ControlModifier:
+            angle_delta = event.angleDelta()
+            delta = angle_delta.y() or angle_delta.x()
+            if delta != 0:
+                steps = delta / 120.0
+                factor = 1.25 ** steps
+                self.set_zoom(self._zoom * factor, auto_fit=False)
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def set_zoom(self, zoom: float, *, auto_fit: bool = False) -> None:
         zoom = max(0.25, min(5.0, zoom))
@@ -642,6 +1110,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._read_only_output = False
         self._output_mode_label = QtWidgets.QLabel("Output Mode: Editable (fillable)")
         self.statusBar().addPermanentWidget(self._output_mode_label)
+        self._last_generation_mode = "per_entry"
+        self._last_generation_target: Path | None = None
+        self._last_generation_read_only = False
         self._on_zoom_changed(self.pdf_viewer.current_zoom())
         self._set_status("Load data and a PDF template to begin")
 
@@ -656,7 +1127,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._import_data_action.triggered.connect(self._action_import_data)
         self._import_data_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+D"))
         # Improved icon contrast with Fluent icons
-        self._import_data_action.setIcon(get_fluent_icon("FOLDER"))
+        self._import_data_action.setIcon(get_fluent_icon("FOLDER_ADD", "CLOUD_DOWNLOAD", "DOWNLOAD", default=FI.DOWNLOAD))
 
         self._import_pdf_action = QtGui.QAction("Import PDF", self)
         self._import_pdf_action.triggered.connect(self._action_import_pdf)
@@ -674,7 +1145,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_mapping_action.triggered.connect(self._action_load_mapping)
         self._load_mapping_action.setShortcut(QtGui.QKeySequence.Open)
         # Improved icon contrast with Fluent icons
-        self._load_mapping_action.setIcon(get_fluent_icon("FOLDER"))
+        self._load_mapping_action.setIcon(get_fluent_icon("OPEN_FOLDER", "FOLDER", default=FI.FOLDER))
 
         self._adjust_range_action = QtGui.QAction("Adjust Data Range", self)
         self._adjust_range_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+R"))
@@ -682,44 +1153,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._adjust_range_action.setIcon(get_fluent_icon("SYNC"))
         self._adjust_range_action.triggered.connect(self._action_adjust_data_range)
         self._adjust_range_action.setEnabled(False)
-
-        self._output_mode_group = QtGui.QActionGroup(self)
-        self._output_mode_group.setExclusive(True)
-
-        self._output_mode_editable_action = QtGui.QAction("Editable Output (fillable)", self)
-        self._output_mode_editable_action.setCheckable(True)
-        self._output_mode_group.addAction(self._output_mode_editable_action)
-        self._output_mode_editable_action.toggled.connect(
-            lambda checked: checked and self._set_output_mode(editable=True, announce=True)
-        )
-
-        self._output_mode_readonly_action = QtGui.QAction("Read-Only Output (locked)", self)
-        self._output_mode_readonly_action.setCheckable(True)
-        self._output_mode_group.addAction(self._output_mode_readonly_action)
-        self._output_mode_readonly_action.toggled.connect(
-            lambda checked: checked and self._set_output_mode(editable=False, announce=True)
-        )
-
-        self._output_mode_widget = QtWidgets.QWidget()
-        mode_layout = QtWidgets.QHBoxLayout(self._output_mode_widget)
-        mode_layout.setContentsMargins(6, 0, 6, 0)
-        mode_layout.setSpacing(8)
-        mode_layout.addWidget(QtWidgets.QLabel("Output:"))
-        self._editable_radio = QtWidgets.QRadioButton("Editable")
-        self._editable_radio.setToolTip("Generate PDFs that remain fillable.")
-        self._editable_radio.toggled.connect(
-            lambda checked: checked and self._set_output_mode(editable=True, announce=True)
-        )
-        mode_layout.addWidget(self._editable_radio)
-        self._readonly_radio = QtWidgets.QRadioButton("Read-Only")
-        self._readonly_radio.setToolTip("Generate PDFs with fields locked (read-only) without flattening.")
-        self._readonly_radio.toggled.connect(
-            lambda checked: checked and self._set_output_mode(editable=False, announce=True)
-        )
-        mode_layout.addWidget(self._readonly_radio)
-        mode_layout.addStretch(1)
-        self._output_mode_widget_action = QtWidgets.QWidgetAction(self)
-        self._output_mode_widget_action.setDefaultWidget(self._output_mode_widget)
 
         self._edit_mapping_action = QtGui.QAction("Edit Mapping", self)
         self._edit_mapping_action.triggered.connect(lambda: self._action_edit_mapping())
@@ -748,11 +1181,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._load_mapping_action,
                 self._adjust_range_action,
                 self._edit_mapping_action,
-                self._remove_mapping_action,
-                self._generate_action,
-            ]
-        )
-        toolbar.addAction(self._output_mode_widget_action)
+                  self._remove_mapping_action,
+                  self._generate_action,
+              ]
+          )
 
         toolbar.addSeparator()
         page_label = QtWidgets.QLabel("Page")
@@ -824,9 +1256,6 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu.addAction(self._save_mapping_action)
         file_menu.addAction(self._load_mapping_action)
         file_menu.addAction(self._adjust_range_action)
-        output_menu = file_menu.addMenu("Output Mode")
-        output_menu.addAction(self._output_mode_editable_action)
-        output_menu.addAction(self._output_mode_readonly_action)
         file_menu.addAction(self._edit_mapping_action)
         file_menu.addAction(self._remove_mapping_action)
         file_menu.addSeparator()
@@ -1045,6 +1474,58 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(f"Loaded mapping '{Path(path).name}'", timeout=6000)
         self._update_data_actions()
 
+    def _load_generation_defaults(self) -> Dict[str, Any]:
+        settings = self._settings
+        mode_value = settings.value(GENERATION_MODE_KEY, "per_entry")
+        directory = self._read_path_setting(GENERATION_DIR_KEY)
+        file_path = self._read_path_setting(GENERATION_FILE_KEY)
+        columns = self._read_list_setting(GENERATION_COLUMNS_KEY)
+        prefix_value = settings.value(GENERATION_PREFIX_KEY, "")
+        suffix_value = settings.value(GENERATION_SUFFIX_KEY, "")
+        separator_value = settings.value(GENERATION_SEPARATOR_KEY, "_")
+        read_only_value = settings.value(GENERATION_READ_ONLY_KEY, False, type=bool)
+        return {
+            "mode": str(mode_value) if mode_value else "per_entry",
+            "directory": directory,
+            "file": file_path,
+            "columns": columns,
+            "prefix": str(prefix_value) if prefix_value else "",
+            "suffix": str(suffix_value) if suffix_value else "",
+            "separator": str(separator_value) if separator_value else "_",
+            "read_only": bool(read_only_value),
+        }
+
+    def _persist_generation_defaults(self, options: GenerationOptions) -> None:
+        settings = self._settings
+        settings.setValue(GENERATION_MODE_KEY, options.mode)
+        if options.destination_dir:
+            settings.setValue(GENERATION_DIR_KEY, str(options.destination_dir))
+        if options.combined_path:
+            settings.setValue(GENERATION_FILE_KEY, str(options.combined_path))
+        settings.setValue(GENERATION_COLUMNS_KEY, "|".join(options.columns))
+        settings.setValue(GENERATION_PREFIX_KEY, options.prefix)
+        settings.setValue(GENERATION_SUFFIX_KEY, options.suffix)
+        settings.setValue(GENERATION_SEPARATOR_KEY, options.separator)
+        settings.setValue(GENERATION_READ_ONLY_KEY, options.read_only)
+
+    def _read_path_setting(self, key: str) -> Path | None:
+        value = self._settings.value(key)
+        if not value:
+            return None
+        try:
+            return Path(str(value))
+        except TypeError:
+            return None
+
+    def _read_list_setting(self, key: str) -> list[str]:
+        value = self._settings.value(key, [])
+        if isinstance(value, str):
+            if not value:
+                return []
+            return [item for item in value.split("|") if item]
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value if item]
+        return []
     def _action_generate_pdfs(self) -> None:
         if not self._state.data_sample or not self._state.pdf_template:
             QtWidgets.QMessageBox.warning(
@@ -1055,13 +1536,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._state.mapping.rules:
             QtWidgets.QMessageBox.warning(self, "Missing Mapping", "Map at least one field first.")
             self._set_status("Create at least one mapping before generating PDFs", timeout=5000)
-            return
-
-        destination = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Select Output Directory", ""
-        )
-        if not destination:
-            self._set_status("PDF generation cancelled", timeout=4000)
             return
 
         if self._generation_thread and self._generation_thread.isRunning():
@@ -1077,25 +1551,95 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_status("Data source contains no rows", timeout=4000)
             return
 
-        read_only_choice = getattr(self, "_read_only_output", False)
-        mode_suffix = " (read-only)" if read_only_choice else " (editable)"
-        self._set_status(f"Generating PDFs into '{Path(destination).name}'{mode_suffix}")
+        defaults = self._load_generation_defaults()
+        columns = list(self._state.data_sample.dataframe.columns)
+        sample_row = rows[0] if rows else {}
+
+        dialog = GeneratePdfDialog(
+            self,
+            columns=columns,
+            sample_row=sample_row,
+            default_mode=defaults["mode"],
+            default_directory=defaults["directory"],
+            default_file=defaults["file"],
+            default_columns=defaults["columns"],
+            default_prefix=defaults["prefix"],
+            default_suffix=defaults["suffix"],
+            default_separator=defaults["separator"],
+            default_read_only=defaults["read_only"],
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            self._set_status("PDF generation cancelled", timeout=4000)
+            return
+
+        options = dialog.options()
+        self._persist_generation_defaults(options)
+
+        builder = FilenameBuilder(
+            options.columns,
+            prefix=options.prefix,
+            suffix=options.suffix,
+            separator=options.separator or "_",
+        )
+
+        read_only_choice = options.read_only
+
+        self._set_output_mode(editable=not read_only_choice, announce=False)
+
+        output_dir: Path | None = None
+        combined_path: Path | None = None
+        try:
+            if options.mode == "per_entry":
+                if options.destination_dir is None:
+                    raise ValueError("Select an output folder.")
+                output_dir = options.destination_dir.expanduser().resolve()
+                output_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                if options.combined_path is None:
+                    raise ValueError("Choose a combined PDF filename.")
+                combined_path = options.combined_path.expanduser().resolve()
+                combined_path = combined_path.with_suffix(".pdf")
+                combined_path.parent.mkdir(parents=True, exist_ok=True)
+                output_dir = combined_path.parent
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Destination Error", str(exc))
+            return
+
+        behavior = "read-only" if read_only_choice else "editable"
+        if options.mode == "per_entry":
+            status_target = output_dir.name if output_dir else ""
+            self._set_status(
+                f"Generating {len(rows)} PDFs into '{status_target}' ({behavior})",
+                timeout=5000,
+            )
+        else:
+            assert combined_path is not None
+            self._set_status(
+                f"Generating combined PDF '{combined_path.name}' ({behavior})", timeout=5000
+            )
+
         progress = QtWidgets.QProgressDialog(
             "Generating PDFs...", "Cancel", 0, len(rows), self, QtCore.Qt.WindowTitleHint
         )
         progress.setWindowModality(QtCore.Qt.WindowModal)
         progress.setValue(0)
 
+        flatten_output = False
+
         worker = PdfGenerationWorker(
             self._pdf_engine,
             self._state.pdf_template.path,
-            Path(destination),
+            output_dir or Path.cwd(),
             list(self._state.mapping.iter_rules()),
             rows,
-            flatten=False,
+            flatten=flatten_output,
             read_only=read_only_choice,
-            template_metadata=None,
+            template_metadata=self._state.pdf_template,
+            mode=options.mode,
+            combined_output=combined_path,
+            filename_builder=builder,
         )
+
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
 
@@ -1111,6 +1655,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._generation_thread = thread
         self._generation_worker = worker
         self._generation_progress = progress
+        self._last_generation_mode = options.mode
+        self._last_generation_target = combined_path if combined_path else output_dir
+        self._last_generation_read_only = read_only_choice
 
         thread.start()
         progress.show()
@@ -1136,7 +1683,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for _, rule in sorted(rules.items(), key=lambda item: item[0]):
             descriptor = rule.describe()
             for target in rule.targets:
-                preview_value = sample_payload.get(target, "")
+                raw_value = sample_payload.get(target, "")
+                preview_value = self._render_preview_value(raw_value)
                 self.pdf_viewer.set_assignment(target, descriptor, preview_value)
         self._update_mapping_action_state()
 
@@ -1153,17 +1701,34 @@ class MainWindow(QtWidgets.QMainWindow):
             return ""
         values = []
         for target in rule.targets:
-            value = payload.get(target, "")
-            if value:
-                values.append(f"{target}: {value}")
+            raw_value = payload.get(target, "")
+            display_value = self._render_preview_value(raw_value)
+            if display_value:
+                values.append(f"{target}: {display_value}")
         if values:
             if len(rule.targets) == 1:
                 return values[0].split(": ", 1)[-1]
             return "; ".join(values)
         for target in rule.targets:
             if target in payload:
-                return payload.get(target, "") or ""
+                return self._render_preview_value(payload.get(target, ""))
         return ""
+
+    def _render_preview_value(self, value: object) -> str:
+        """Return the text to show in previews, mimicking checkbox appearance."""
+        checkmark = "\u2713"
+        kind, normalized = PdfEngine._normalize_payload_value(value)
+        if kind != "checkbox":
+            return str(normalized)
+        if isinstance(normalized, str):
+            stripped = normalized.strip()
+            lowered = stripped.lstrip("/").lower()
+            if lowered in {"", "off", "no", "false", "0", "unchecked"}:
+                return ""
+            return checkmark
+        if isinstance(normalized, bool):
+            return checkmark if normalized else ""
+        return checkmark if normalized else ""
 
     def _show_pdf_viewer(self) -> None:
         self.viewer_stack.setCurrentWidget(self.pdf_viewer)
@@ -1282,23 +1847,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_output_mode(self, *, editable: bool, announce: bool = False) -> None:
         self._read_only_output = not editable
 
-        if hasattr(self, "_editable_radio"):
-            self._editable_radio.blockSignals(True)
-            self._editable_radio.setChecked(editable)
-            self._editable_radio.blockSignals(False)
-        if hasattr(self, "_readonly_radio"):
-            self._readonly_radio.blockSignals(True)
-            self._readonly_radio.setChecked(not editable)
-            self._readonly_radio.blockSignals(False)
-        if hasattr(self, "_output_mode_editable_action"):
-            self._output_mode_editable_action.blockSignals(True)
-            self._output_mode_editable_action.setChecked(editable)
-            self._output_mode_editable_action.blockSignals(False)
-        if hasattr(self, "_output_mode_readonly_action"):
-            self._output_mode_readonly_action.blockSignals(True)
-            self._output_mode_readonly_action.setChecked(not editable)
-            self._output_mode_readonly_action.blockSignals(False)
-
         self._update_output_mode_label(editable)
 
         if announce:
@@ -1397,8 +1945,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(f"Generating PDFs... {current}/{total}", timeout=1500)
 
     def _on_generation_completed(self, outputs: list[Path]) -> None:
-        destination = outputs[0].parent if outputs else None
+        mode = getattr(self, "_last_generation_mode", "per_entry")
+        target = getattr(self, "_last_generation_target", None)
         self._cleanup_generation_worker()
+
+        if mode == "combined":
+            final_path = outputs[0] if outputs else target
+            if final_path:
+                final_path = Path(final_path)
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Generation Complete",
+                    f"Created combined PDF at {final_path}.",
+                )
+                self._set_status(f"Combined PDF saved as {final_path.name}", timeout=6000)
+                self._last_generation_target = None
+            else:
+                self._set_status("Combined PDF created", timeout=6000)
+                self._last_generation_target = None
+            return
+
+        destination = target or (outputs[0].parent if outputs else None)
         if destination:
             QtWidgets.QMessageBox.information(
                 self,
@@ -1406,14 +1973,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Created {len(outputs)} PDF files in {destination}.",
             )
             self._set_status(f"Created {len(outputs)} PDF files", timeout=6000)
+            self._last_generation_target = None
+        else:
+            self._last_generation_target = None
 
     def _on_generation_failed(self, message: str) -> None:
         self._cleanup_generation_worker()
+        self._last_generation_target = None
         QtWidgets.QMessageBox.critical(self, "Generation Failed", message)
         self._set_status("PDF generation failed", timeout=6000)
 
     def _on_generation_cancelled(self) -> None:
         self._cleanup_generation_worker()
+        self._last_generation_target = None
         QtWidgets.QMessageBox.information(self, "Generation Cancelled", "PDF creation cancelled.")
         self._set_status("PDF generation cancelled", timeout=4000)
 
@@ -1558,6 +2130,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(widget, "viewport"):
                 widget.viewport().update()
             widget.repaint()
+
+
+
 
 
 
