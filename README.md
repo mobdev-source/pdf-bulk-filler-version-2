@@ -20,12 +20,18 @@ Use `python -m pdf_bulk_filler.main --no-gui` for automated smoke checks, or `--
 
 ## Key Features
 
-- Split-screen interface built with PySide6 showing spreadsheet columns alongside a rendered PDF page with per-page navigation, zoom controls, and menu shortcuts.
-- Drag column headers onto highlighted PDF form fields to build reusable mappings, then prune assignments directly from the mapping table.
-- Excel imports prompt for worksheet selection when multiple sheets exist, and the chosen sheet stays attached to saved mappings. If headers begin deeper in the file, use 'Adjust Data Range' to set header/data rows and the first column before mapping fields.
-- Persist mappings to JSON and regenerate them later; sample assets live under `assets/` (`sample_contacts.csv` + `sample_invoice.pdf`) for quick demos.
-- Batch-generate filled PDFs locally using a responsive background worker; progress streams to the status bar and output can be flattened for immutable delivery.
+- Split-screen PySide6 UI that keeps spreadsheet columns visible beside the PDF preview, complete with per-page navigation and zoom shortcuts.
+- Filter the available columns instantly with the built-in search box, then drag headers onto highlighted PDF form fields to create reusable mappings.
+- Excel imports prompt for worksheet selection when several sheets are present, and saved mappings remember the chosen sheet. When headers or data start deeper in the file, use **Adjust Data Range** to set header/data rows and the first column before mapping fields.
+- Persist mappings to JSON and reload them later; sample datasets and templates live under `assets/data/` and `assets/templates/` (e.g., `sample_contacts.xlsx`, `Fillable_CIS-Individual-BPI.pdf`) for quick demos.
+- Generate individual or combined PDFs locally via a background worker; progress updates stream to the status bar, with optional read-only output for immutable delivery.
 
 To build standalone executables, wire PyInstaller against the console script `pdf-bulk-filler`.
+
+## Development Tips
+
+- Run the test suite with `pytest -q` before committing changes.
+- The CLI accepts `--no-gui` for headless validation and `--data/--template/--mapping` arguments to preload resources during manual testing.
+- Keep new fixtures under `tests/fixtures/` and leverage the sample workbooks/PDFs in `assets/` for regression coverage.
 
 

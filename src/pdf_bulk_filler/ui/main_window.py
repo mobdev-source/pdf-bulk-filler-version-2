@@ -47,6 +47,8 @@ THEME_MAP = {
     "dark": Theme.DARK,
 }
 
+ACCENT_COLOR = QtGui.QColor("#3A7BD5")
+
 from pdf_bulk_filler.data.loader import DataLoader, DataSample
 from pdf_bulk_filler.mapping.manager import MappingManager, MappingModel
 from pdf_bulk_filler.mapping.rules import MappingRule, evaluate_rules
@@ -201,20 +203,48 @@ class ColumnListWidget(QtWidgets.QListWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self._all_columns: list[str] = []
+        self._filter_text: str = ""
         self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.setDragEnabled(True)
         self.setAlternatingRowColors(True)
 
     def set_columns(self, columns: Iterable[str]) -> None:
-        self.clear()
-        for column in columns:
-            self.addItem(column)
+        self._all_columns = [str(column) for column in columns]
+        self._rebuild_visible_items()
+
+    def clear(self) -> None:  # noqa: D401
+        """Clear visible and cached columns."""
+        super().clear()
+        self._all_columns = []
+        self._filter_text = ""
+
+    def apply_filter(self, text: str) -> None:
+        normalized = (text or "").strip().lower()
+        if normalized == self._filter_text:
+            return
+        self._filter_text = normalized
+        self._rebuild_visible_items()
 
     def mimeData(self, items: list[QtWidgets.QListWidgetItem]) -> QtCore.QMimeData:  # noqa: N802
         mime = QtCore.QMimeData()
         if items:
             mime.setText(items[0].text())
         return mime
+
+    def _rebuild_visible_items(self) -> None:
+        selected_text = self.currentItem().text() if self.currentItem() else None
+        self.setUpdatesEnabled(False)
+        super().clear()
+        for column in self._all_columns:
+            if self._filter_text and self._filter_text not in column.lower():
+                continue
+            self.addItem(column)
+        self.setUpdatesEnabled(True)
+        if selected_text:
+            matches = self.findItems(selected_text, QtCore.Qt.MatchExactly)
+            if matches:
+                self.setCurrentItem(matches[0])
 
 
 
@@ -245,9 +275,15 @@ class SpreadsheetPanel(QtWidgets.QWidget):
         column_layout = QtWidgets.QVBoxLayout(column_container)
         column_layout.setContentsMargins(0, 0, 0, 0)
         column_layout.setSpacing(4)
-        column_layout.addWidget(QtWidgets.QLabel("Columns"))
+        column_header = QtWidgets.QLabel("Columns")
+        column_layout.addWidget(column_header)
+        self.column_search = QtWidgets.QLineEdit()
+        self.column_search.setPlaceholderText("Search columns...")
+        self.column_search.setClearButtonEnabled(True)
+        self.column_search.setEnabled(False)
+        self.column_search.hide()
+        column_layout.addWidget(self.column_search)
         column_layout.addWidget(self.columns_widget)
-
         self.table_model = DataFrameModel()
         self.table_view = QtWidgets.QTableView()
         self.table_view.setModel(self.table_model)
@@ -269,11 +305,19 @@ class SpreadsheetPanel(QtWidgets.QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
+        self.column_search.textChanged.connect(self.columns_widget.apply_filter)
+
         layout.addLayout(summary_layout)
         layout.addWidget(splitter)
 
     def set_data(self, sample: DataSample) -> None:
-        self.columns_widget.set_columns(sample.columns())
+        columns = sample.columns()
+        if self.column_search.text():
+            self.column_search.setText("")
+        has_columns = bool(columns)
+        self.column_search.setEnabled(has_columns)
+        self.column_search.setVisible(has_columns)
+        self.columns_widget.set_columns(columns)
         preview = sample.head_records(50)
         self.table_model.update(preview)
         rows, cols = sample.dataframe.shape
@@ -282,6 +326,9 @@ class SpreadsheetPanel(QtWidgets.QWidget):
 
     def clear(self) -> None:
         self.columns_widget.clear()
+        self.column_search.clear()
+        self.column_search.setEnabled(False)
+        self.column_search.hide()
         self.table_model.update(pd.DataFrame())
         self.data_summary_label.setText("No dataset loaded")
 
@@ -1075,6 +1122,14 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         )
 
+        self.mapping_table = MappingTable()
+        self.mapping_table.editRequested.connect(lambda field: self._action_edit_mapping(field))
+        self.mapping_table.removeRequested.connect(lambda field: self._action_remove_mapping(field))
+        self.mapping_table.itemSelectionChanged.connect(self._update_mapping_action_state)
+        self._mapping_dock = QtWidgets.QDockWidget("Mappings", self)
+        self._mapping_dock.setWidget(self.mapping_table)
+        self._mapping_dock.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.TopDockWidgetArea)
+
         splitter = QtWidgets.QSplitter()
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self.spreadsheet_panel)
@@ -1083,14 +1138,6 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 4)
         splitter.setSizes([360, 1080])
         self._splitter = splitter
-
-        self.mapping_table = MappingTable()
-        self.mapping_table.editRequested.connect(lambda field: self._action_edit_mapping(field))
-        self.mapping_table.removeRequested.connect(lambda field: self._action_remove_mapping(field))
-        self.mapping_table.itemSelectionChanged.connect(self._update_mapping_action_state)
-        self._mapping_dock = QtWidgets.QDockWidget("Mappings", self)
-        self._mapping_dock.setWidget(self.mapping_table)
-        self._mapping_dock.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.TopDockWidgetArea)
 
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
@@ -2034,7 +2081,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if mode not in THEME_MAP:
             mode = DEFAULT_THEME_MODE
         setTheme(THEME_MAP[mode])
-        setThemeColor(ThemeColor.PRIMARY.color())
+        setThemeColor(ACCENT_COLOR)
         # Added theme switcher and persistence
         self._apply_palette_for_theme(qconfig.theme)
         self._theme_mode = mode
