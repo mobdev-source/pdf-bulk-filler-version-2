@@ -201,6 +201,8 @@ class DataFrameModel(QtCore.QAbstractTableModel):
 class ColumnListWidget(QtWidgets.QListWidget):
     """Displays column names and provides drag support."""
 
+    columnActivated = QtCore.Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self._all_columns: list[str] = []
@@ -208,6 +210,8 @@ class ColumnListWidget(QtWidgets.QListWidget):
         self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.setDragEnabled(True)
         self.setAlternatingRowColors(True)
+        self.itemClicked.connect(self._emit_column_activated)
+        self.itemActivated.connect(self._emit_column_activated)
 
     def set_columns(self, columns: Iterable[str]) -> None:
         self._all_columns = [str(column) for column in columns]
@@ -246,7 +250,198 @@ class ColumnListWidget(QtWidgets.QListWidget):
             if matches:
                 self.setCurrentItem(matches[0])
 
+    def _emit_column_activated(self, item: QtWidgets.QListWidgetItem | None) -> None:
+        if item is not None:
+            self.columnActivated.emit(item.text())
 
+
+class TooltipStyler(QtCore.QObject):
+    """Ensure Qt tooltips mirror the application's theme aesthetic."""
+
+    def __init__(self, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._background = "#ffffff"
+        self._text = "#1f1f23"
+        self._border = QtGui.QColor(ACCENT_COLOR)
+        self._shadow_color = QtGui.QColor(31, 31, 35, 90)
+        self._padding = (4, 10)
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    def update_theme(
+        self,
+        *,
+        background: str,
+        text: str,
+        border: QtGui.QColor,
+        shadow: QtGui.QColor,
+    ) -> None:
+        self._background = background
+        self._text = text
+        self._border = border
+        self._shadow_color = shadow
+        self._restyle_active_tooltip()
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if isinstance(obj, QtWidgets.QWidget) and obj.objectName() in {"qt_tip_label", "qt_tooltip_label"}:
+            if event.type() in {
+                QtCore.QEvent.Show,
+                QtCore.QEvent.PaletteChange,
+                QtCore.QEvent.Resize,
+            }:
+                QtCore.QTimer.singleShot(0, lambda widget=obj: self._apply_styles(widget))
+        return super().eventFilter(obj, event)
+
+    def _restyle_active_tooltip(self) -> None:
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        tooltip = app.findChild(QtWidgets.QLabel, "qt_tip_label")
+        if tooltip is None:
+            tooltip = app.findChild(QtWidgets.QLabel, "qt_tooltip_label")
+        if tooltip is not None:
+            self._apply_styles(tooltip)
+
+    def _apply_styles(self, tooltip: QtWidgets.QWidget) -> None:
+        tooltip.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        left, right = self._padding
+        tooltip.setStyleSheet(
+            "QLabel {"
+            f" color: {self._text};"
+            f" background-color: {self._background};"
+            f" border: 1px solid {self._border.name(QtGui.QColor.HexArgb)};"
+            " border-radius: 8px;"
+            f" padding: 4px {right}px 4px {left}px;"
+            "}"
+        )
+        shadow = tooltip.graphicsEffect()
+        if not isinstance(shadow, QtWidgets.QGraphicsDropShadowEffect):
+            shadow = QtWidgets.QGraphicsDropShadowEffect(tooltip)
+            tooltip.setGraphicsEffect(shadow)
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 4)
+        shadow.setColor(self._shadow_color)
+
+
+class ThemedTooltip(QtWidgets.QFrame):
+    """Custom tooltip widget with rounded corners and drop shadow."""
+
+    def __init__(self) -> None:
+        super().__init__(parent=None)
+        self.setWindowFlag(QtCore.Qt.ToolTip, True)
+        self.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+        self._background = QtGui.QColor("#ffffff")
+        self._border = QtGui.QColor(ACCENT_COLOR)
+        self._text = QtGui.QColor("#1f1f23")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._label = QtWidgets.QLabel()
+        self._label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self._label.setTextFormat(QtCore.Qt.PlainText)
+        self._label.setWordWrap(True)
+        layout.addWidget(self._label)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(14)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QtGui.QColor(31, 31, 35, 100))
+        self.setGraphicsEffect(shadow)
+        self._shadow_effect = shadow
+
+    def set_palette(self, *, background: str, text: str, border: QtGui.QColor, shadow: QtGui.QColor) -> None:
+        self._background = QtGui.QColor(background)
+        self._text = QtGui.QColor(text)
+        self._border = border
+        self._shadow_effect.setColor(shadow)
+        self._label.setStyleSheet(f"QLabel {{ color: {self._text.name()}; padding: 6px 10px; }}")
+        self.update()
+
+    def set_text(self, text: str) -> None:
+        self._label.setText(text)
+        self.adjustSize()
+
+    def show_at(self, pos: QtCore.QPoint) -> None:
+        screen = QtGui.QGuiApplication.screenAt(pos)
+        geom = screen.availableGeometry() if screen else QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        self.adjustSize()
+        size = self.size()
+        x = pos.x() + 12
+        y = pos.y() + 16
+        if x + size.width() > geom.right():
+            x = geom.right() - size.width() - 8
+        if y + size.height() > geom.bottom():
+            y = pos.y() - size.height() - 12
+        self.move(x, y)
+        self.show()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        rect = self.rect().adjusted(4, 4, -4, -4)
+        path = QtGui.QPainterPath()
+        radius = 2.0
+        path.addRoundedRect(rect, radius, radius)
+        painter.setPen(QtGui.QPen(self._border, 1))
+        painter.setBrush(QtGui.QBrush(self._background))
+        painter.drawPath(path)
+
+
+class CustomTooltipManager(QtCore.QObject):
+    """Global manager that displays themed tooltips and suppresses system styling."""
+
+    def __init__(self, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._tooltip_widget = ThemedTooltip()
+        self._tooltip_widget.hide()
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        self._hide_timer = QtCore.QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._tooltip_widget.hide)
+
+    def update_theme(self, *, background: str, text: str, border: QtGui.QColor, shadow: QtGui.QColor) -> None:
+        self._tooltip_widget.set_palette(background=background, text=text, border=border, shadow=shadow)
+
+    def show_text(self, text: str, global_pos: QtCore.QPoint) -> None:
+        if not text:
+            self._tooltip_widget.hide()
+            return
+        self._tooltip_widget.set_text(text)
+        self._tooltip_widget.show_at(global_pos)
+        self._hide_timer.start(8000)
+
+    def hide(self) -> None:
+        self._hide_timer.stop()
+        self._tooltip_widget.hide()
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
+        if event.type() == QtCore.QEvent.ToolTip:
+            widget = obj if isinstance(obj, QtWidgets.QWidget) else None
+            help_event = event  # type: ignore[assignment]
+            text = widget.toolTip() if widget is not None else ""
+            if text:
+                self.show_text(text, help_event.globalPos())
+            else:
+                self.hide()
+            return True
+        if event.type() in {
+            QtCore.QEvent.Leave,
+            QtCore.QEvent.FocusOut,
+            QtCore.QEvent.WindowDeactivate,
+            QtCore.QEvent.HoverLeave,
+            QtCore.QEvent.MouseButtonPress,
+        }:
+            self.hide()
+        return super().eventFilter(obj, event)
 
 class SpreadsheetPanel(QtWidgets.QWidget):
     """Left panel showing preview of the tabular dataset."""
@@ -318,6 +513,7 @@ class SpreadsheetPanel(QtWidgets.QWidget):
         self.column_search.setEnabled(has_columns)
         self.column_search.setVisible(has_columns)
         self.columns_widget.set_columns(columns)
+        self.columns_widget.clearSelection()
         preview = sample.head_records(50)
         self.table_model.update(preview)
         rows, cols = sample.dataframe.shape
@@ -326,6 +522,7 @@ class SpreadsheetPanel(QtWidgets.QWidget):
 
     def clear(self) -> None:
         self.columns_widget.clear()
+        self.columns_widget.clearSelection()
         self.column_search.clear()
         self.column_search.setEnabled(False)
         self.column_search.hide()
@@ -655,17 +852,62 @@ class PdfFieldItem(QtWidgets.QGraphicsRectItem):
         field: PdfField,
         rect: QtCore.QRectF,
         drop_callback: Callable[[PdfField, str], None],
+        click_callback: Callable[[PdfField], None],
+        remove_callback: Callable[[PdfField], None],
+        tooltip_manager: CustomTooltipManager | None,
     ) -> None:
         super().__init__(rect)
         self.field = field
         self._drop_callback = drop_callback
+        self._click_callback = click_callback
+        self._remove_callback = remove_callback
+        self._tooltip_manager = tooltip_manager
         self.setBrush(QtGui.QColor(0, 170, 255, 50))
-        self.setPen(QtGui.QPen(QtGui.QColor(0, 120, 215), 1, QtCore.Qt.DashLine))
+        self._base_pen = QtGui.QPen(QtGui.QColor(0, 120, 215), 1, QtCore.Qt.DashLine)
+        self._selected_pen = QtGui.QPen(QtGui.QColor(ACCENT_COLOR), 2)
+        self._selected_pen.setStyle(QtCore.Qt.SolidLine)
+        self.setPen(self._base_pen)
         self.setZValue(1)
         self.setAcceptDrops(True)
         self.setAcceptHoverEvents(True)
+        self.setAcceptedMouseButtons(QtCore.Qt.AllButtons)
         self._label: QtWidgets.QGraphicsSimpleTextItem | None = None
         self._current_column: str | None = None
+        self._selected = False
+        self._overlay_container = QtWidgets.QWidget()
+        overlay_layout = QtWidgets.QHBoxLayout(self._overlay_container)
+        overlay_layout.setContentsMargins(2, 2, 2, 2)
+        overlay_layout.setSpacing(4)
+
+        self._select_button = QtWidgets.QToolButton()
+        self._select_button.setIcon(get_fluent_icon("SELECT_ALL", "ADD", default=FI.ADD))
+        self._select_button.setIconSize(QtCore.QSize(16, 16))
+        self._select_button.setToolTip("Select this field")
+        self._select_button.setAutoRaise(True)
+        self._select_button.clicked.connect(lambda: self._click_callback(self.field))
+
+        self._edit_button = QtWidgets.QToolButton()
+        self._edit_button.setIcon(get_fluent_icon("EDIT", default=FI.EDIT))
+        self._edit_button.setIconSize(QtCore.QSize(16, 16))
+        self._edit_button.setToolTip("Edit mapping")
+        self._edit_button.setAutoRaise(True)
+        self._edit_button.clicked.connect(lambda: self._click_callback(self.field))
+
+        self._remove_button = QtWidgets.QToolButton()
+        self._remove_button.setIcon(get_fluent_icon("DELETE", default=FI.DELETE))
+        self._remove_button.setIconSize(QtCore.QSize(16, 16))
+        self._remove_button.setToolTip("Remove mapping")
+        self._remove_button.setAutoRaise(True)
+        self._remove_button.clicked.connect(lambda: self._remove_callback(self.field))
+
+        overlay_layout.addWidget(self._select_button)
+        overlay_layout.addWidget(self._edit_button)
+        overlay_layout.addWidget(self._remove_button)
+
+        self._overlay_proxy = QtWidgets.QGraphicsProxyWidget(self)
+        self._overlay_proxy.setWidget(self._overlay_container)
+        self._overlay_proxy.setZValue(3)
+        self._overlay_proxy.setVisible(False)
 
     def dragEnterEvent(self, event: QtWidgets.QGraphicsSceneDragDropEvent) -> None:  # noqa: N802
         if event.mimeData().hasText():
@@ -695,6 +937,8 @@ class PdfFieldItem(QtWidgets.QGraphicsRectItem):
             self.setBrush(QtGui.QColor(0, 170, 255, 50))
             if self._label:
                 self._label.setText("")
+        self._apply_selection_style()
+        self._update_overlay()
 
     def _ensure_label(self) -> QtWidgets.QGraphicsSimpleTextItem:
         if self._label is None:
@@ -715,12 +959,34 @@ class PdfFieldItem(QtWidgets.QGraphicsRectItem):
         super().hoverMoveEvent(event)
 
     def hoverLeaveEvent(self, event: QtWidgets.QGraphicsSceneHoverEvent) -> None:  # noqa: N802
-        QtWidgets.QToolTip.hideText()
+        if self._tooltip_manager:
+            self._tooltip_manager.hide()
+        else:
+            QtWidgets.QToolTip.hideText()
         super().hoverLeaveEvent(event)
 
     def mousePressEvent(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.LeftButton:
+            self._click_callback(self.field)
         self._show_tooltip(event)
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event: QtWidgets.QGraphicsSceneContextMenuEvent) -> None:  # noqa: N802
+        if self._tooltip_manager:
+            self._tooltip_manager.hide()
+        menu = QtWidgets.QMenu()
+        if self._current_column:
+            edit_icon = get_fluent_icon("EDIT", default=FI.EDIT)
+            edit_action = menu.addAction(edit_icon, "Edit Mapping…")
+            edit_action.triggered.connect(lambda: self._click_callback(self.field))
+            remove_icon = get_fluent_icon("DELETE", default=FI.DELETE)
+            remove_action = menu.addAction(remove_icon, "Remove Mapping")
+            remove_action.triggered.connect(lambda: self._remove_callback(self.field))
+        else:
+            select_icon = get_fluent_icon("SELECT_ALL", "ADD", default=FI.ADD)
+            select_action = menu.addAction(select_icon, "Select Field")
+            select_action.triggered.connect(lambda: self._click_callback(self.field))
+        menu.exec(event.screenPos())
 
     def _show_tooltip(self, event: QtCore.QEvent) -> None:
         tooltip = self.toolTip() or f"PDF Field: {self.field.field_name}"
@@ -728,11 +994,15 @@ class PdfFieldItem(QtWidgets.QGraphicsRectItem):
             pos = event.screenPos()
         else:
             pos = QtGui.QCursor.pos()
-        QtWidgets.QToolTip.showText(
-            QtCore.QPoint(int(pos.x()), int(pos.y())),
-            tooltip,
-            None,
-        )
+        global_pos = QtCore.QPoint(int(pos.x()), int(pos.y()))
+        if self._tooltip_manager:
+            self._tooltip_manager.show_text(tooltip, global_pos)
+        else:
+            QtWidgets.QToolTip.showText(
+                global_pos,
+                tooltip,
+                None,
+            )
 
     def _set_label_text(self, text: str) -> None:
         label = self._ensure_label()
@@ -783,6 +1053,41 @@ class PdfFieldItem(QtWidgets.QGraphicsRectItem):
         label.setPos(rect.left() + horizontal_padding, rect.top() + vertical_padding)
         label.setText(elided)
 
+    def set_selected(self, selected: bool) -> None:
+        if self._selected == selected:
+            return
+        self._selected = selected
+        self._apply_selection_style()
+        self._update_overlay()
+
+    def _apply_selection_style(self) -> None:
+        self.setPen(self._selected_pen if self._selected else self._base_pen)
+        self._update_overlay()
+
+    def _update_overlay(self) -> None:
+        if self._overlay_proxy is None:
+            return
+        has_mapping = bool(self._current_column)
+        if not self._selected:
+            self._overlay_proxy.setVisible(False)
+            return
+
+        self._select_button.setVisible(not has_mapping)
+        self._edit_button.setVisible(has_mapping)
+        self._remove_button.setVisible(has_mapping)
+        self._overlay_container.adjustSize()
+        self._position_overlay()
+        self._overlay_proxy.setVisible(True)
+
+    def _position_overlay(self) -> None:
+        if not self._overlay_proxy or not self._overlay_proxy.widget():
+            return
+        rect = self.rect()
+        size = self._overlay_container.sizeHint()
+        x = rect.right() - size.width() - 4.0
+        y = rect.top() + 4.0
+        self._overlay_proxy.setPos(x, y)
+
     def _calculate_font_size(
         self,
         font: QtGui.QFont,
@@ -809,10 +1114,13 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
     """Displays a rendered PDF page with draggable form fields."""
 
     fieldAssigned = QtCore.Signal(str, str)
+    fieldActivated = QtCore.Signal(str)
+    fieldRemoveRequested = QtCore.Signal(str)
+    fieldSelectionChanged = QtCore.Signal(object)
     pageChanged = QtCore.Signal(int)
     zoomChanged = QtCore.Signal(float)
 
-    def __init__(self, engine: PdfEngine) -> None:
+    def __init__(self, engine: PdfEngine, *, tooltip_manager: CustomTooltipManager | None = None) -> None:
         super().__init__()
         self._engine = engine
         self._template: PdfTemplate | None = None
@@ -822,6 +1130,8 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
         self._field_items: Dict[str, PdfFieldItem] = {}
         self._auto_fit = False
         self._assignments: Dict[str, tuple[str | None, str | None]] = {}
+        self._selected_field: Optional[str] = None
+        self._tooltip_manager = tooltip_manager
 
         self.setScene(QtWidgets.QGraphicsScene(self))
         self.setRenderHint(QtGui.QPainter.Antialiasing)
@@ -833,6 +1143,7 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
         self._assignments.clear()
         self._page_count = template.document.page_count
         self._current_page = max(0, min(page_index, self._page_count - 1))
+        self._set_selected_field(None)
         self._render_page()
         self.pageChanged.emit(self._current_page)
         self.zoomChanged.emit(self._zoom)
@@ -845,10 +1156,12 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
         self._current_page = 0
         self._auto_fit = False
         self._assignments.clear()
+        self._set_selected_field(None)
         self.zoomChanged.emit(self._zoom)
 
     def _handle_drop(self, field: PdfField, column_name: str) -> None:
         self.fieldAssigned.emit(field.field_name, column_name)
+        self._set_selected_field(None)
 
     def set_assignment(
         self,
@@ -858,6 +1171,7 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
     ) -> None:
         if item := self._field_items.get(field_name):
             item.update_assignment(column_name, sample_value)
+            item.set_selected(field_name == self._selected_field)
         if column_name:
             self._assignments[field_name] = (column_name, sample_value)
         else:
@@ -868,6 +1182,7 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
         for field_name in list(self._assignments.keys()):
             self.set_assignment(field_name, None, None)
         self._assignments.clear()
+        self._set_selected_field(None)
 
     def set_page(self, page_index: int) -> None:
         if self._template is None:
@@ -908,13 +1223,22 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
                 continue
             scaled = field.rect * transform
             rect = QtCore.QRectF(scaled.x0, scaled.y0, scaled.width, scaled.height)
-            item = PdfFieldItem(field, rect, self._handle_drop)
+            item = PdfFieldItem(
+                field,
+                rect,
+                self._handle_drop,
+                self._handle_field_click,
+                self._handle_field_remove,
+                self._tooltip_manager,
+            )
             self.scene().addItem(item)
             self._field_items[field.field_name] = item
+            item.set_selected(field.field_name == self._selected_field)
 
         for field_name, (column, preview) in self._assignments.items():
             if item := self._field_items.get(field_name):
                 item.update_assignment(column, preview)
+                item.set_selected(field_name == self._selected_field)
 
         self.scene().setSceneRect(self.scene().itemsBoundingRect())
         self.resetTransform()
@@ -972,6 +1296,32 @@ class PdfViewerWidget(QtWidgets.QGraphicsView):
             return
 
         self.centerOn(self.scene().sceneRect().center())
+
+    def clear_field_selection(self) -> None:
+        self._set_selected_field(None)
+
+    def _handle_field_remove(self, field: PdfField) -> None:
+        self.fieldRemoveRequested.emit(field.field_name)
+        self._set_selected_field(None)
+
+    def _handle_field_click(self, field: PdfField) -> None:
+        field_name = field.field_name
+        if field_name in self._assignments and self._assignments[field_name][0]:
+            self.fieldActivated.emit(field_name)
+            return
+        if self._selected_field == field_name:
+            self._set_selected_field(None)
+        else:
+            self._set_selected_field(field_name)
+
+    def _set_selected_field(self, field_name: Optional[str], *, emit: bool = True) -> None:
+        if field_name == self._selected_field:
+            return
+        self._selected_field = field_name
+        for name, item in self._field_items.items():
+            item.set_selected(name == self._selected_field)
+        if emit:
+            self.fieldSelectionChanged.emit(self._selected_field)
 
 
 class MappingTable(QtWidgets.QTableWidget):
@@ -1091,6 +1441,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._theme_mode = str(self._settings.value(THEME_SETTINGS_KEY, DEFAULT_THEME_MODE))
         if self._theme_mode not in THEME_MAP:
             self._theme_mode = DEFAULT_THEME_MODE
+        self._tooltip_manager: CustomTooltipManager | None = None
+        self._tooltip_styler = TooltipStyler(self)
         # Added theme switcher and persistence
         self._apply_theme(self._theme_mode, save=False, update_actions=False)
 
@@ -1101,10 +1453,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._state = UiState()
 
         self.spreadsheet_panel = SpreadsheetPanel()
-        self.pdf_viewer = PdfViewerWidget(self._pdf_engine)
+        self.spreadsheet_panel.columns_widget.columnActivated.connect(self._on_column_activated)
+        self.pdf_viewer = PdfViewerWidget(self._pdf_engine, tooltip_manager=self._tooltip_manager)
         self.pdf_viewer.fieldAssigned.connect(self._on_field_assigned)
+        self.pdf_viewer.fieldActivated.connect(lambda field: self._action_edit_mapping(field))
+        self.pdf_viewer.fieldRemoveRequested.connect(self._on_field_remove_requested)
+        self.pdf_viewer.fieldSelectionChanged.connect(self._on_field_selection_changed)
         self.pdf_viewer.pageChanged.connect(self._on_page_changed)
         self.pdf_viewer.zoomChanged.connect(self._on_zoom_changed)
+        self._selected_viewer_field: Optional[str] = None
 
         self._pdf_placeholder = QtWidgets.QLabel(
             "Import a PDF template to preview form fields and begin mapping."
@@ -1145,6 +1502,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(splitter)
         self.setCentralWidget(container)
         self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self._mapping_dock)
+        self._mapping_dock.hide()
+        self._mapping_dock.toggleViewAction().setChecked(False)
 
         self._register_actions()
         self._create_menus()
@@ -1157,10 +1516,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._read_only_output = False
         self._output_mode_label = QtWidgets.QLabel("Output Mode: Editable (fillable)")
         self.statusBar().addPermanentWidget(self._output_mode_label)
+        self._preview_data_label = QtWidgets.QLabel("Preview data: none loaded")
+        self._preview_data_label.setToolTip("Indicates which dataset row feeds the live PDF preview.")
+        self.statusBar().addPermanentWidget(self._preview_data_label)
         self._last_generation_mode = "per_entry"
         self._last_generation_target: Path | None = None
         self._last_generation_read_only = False
         self._on_zoom_changed(self.pdf_viewer.current_zoom())
+        self._update_preview_data_indicator()
         self._set_status("Load data and a PDF template to begin")
 
     # ----- Action configuration -------------------------------------------------
@@ -1233,6 +1596,9 @@ class MainWindow(QtWidgets.QMainWindow):
               ]
           )
 
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
         toolbar.addSeparator()
         page_label = QtWidgets.QLabel("Page")
         page_label.setContentsMargins(8, 0, 4, 0)
@@ -1367,6 +1733,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(f"Loaded data '{sample.source_path.name}'{sheet_msg} ({row_count:,} rows)")
         self._refresh_mapping_labels()
         self._update_data_actions()
+        self._update_preview_data_indicator()
 
     def _action_adjust_data_range(self) -> None:
         sample = self._state.data_sample
@@ -1391,6 +1758,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._refresh_mapping_labels()
         self._update_data_actions()
+        self._update_preview_data_indicator()
 
     def _action_import_pdf(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1480,12 +1848,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._state.mapping.data_row = sample.data_row
                 self._state.mapping.column_offset = sample.column_offset
                 self.spreadsheet_panel.set_data(sample)
+                self.pdf_viewer.clear_field_selection()
+                self._update_preview_data_indicator()
                 sheet_msg = f" (sheet '{sample.sheet_name}')" if sample.sheet_name else ""
                 self._set_status(
                     f"Loaded data '{sample.source_path.name}'{sheet_msg} ({sample.dataframe.shape[0]:,} rows)"
                 )
         else:
             self.spreadsheet_panel.clear()
+            self.pdf_viewer.clear_field_selection()
+            self._update_preview_data_indicator()
             self._state.data_sample = None
             self._state.mapping.source_data = None
             self._state.mapping.data_sheet = None
@@ -1520,6 +1892,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._configure_page_controls_for_template()
         self._set_status(f"Loaded mapping '{Path(path).name}'", timeout=6000)
         self._update_data_actions()
+        self._update_preview_data_indicator()
 
     def _load_generation_defaults(self) -> Dict[str, Any]:
         settings = self._settings
@@ -1713,6 +2086,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_field_assigned(self, field_name: str, column_name: str) -> None:
         self._state.mapping.assign(field_name, column_name)
         self._refresh_mapping_labels()
+        self.pdf_viewer.clear_field_selection()
+        self._update_preview_data_indicator()
+
+    def _on_field_remove_requested(self, field_name: str) -> None:
+        self._action_remove_mapping(field_name)
 
     def _refresh_mapping_labels(self) -> None:
         rules = self._state.mapping.rules
@@ -1920,6 +2298,48 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._output_mode_label.setPalette(palette)
 
+    def _update_preview_data_indicator(self) -> None:
+        """Refresh the status indicator describing the previewed dataset row."""
+        label = getattr(self, "_preview_data_label", None)
+        if label is None:
+            return
+
+        sample = self._state.data_sample
+        if sample is None:
+            label.setText("Preview data: none loaded")
+            label.setToolTip("Load a dataset to drive the live PDF preview.")
+            return
+
+        rows = sample.dataframe.shape[0]
+        if rows == 0:
+            label.setText("Preview data: dataset empty")
+            label.setToolTip("The loaded dataset contains no rows to preview.")
+            return
+
+        sheet = f" - Sheet: {sample.sheet_name}" if sample.sheet_name else ""
+        selected_field = self._selected_viewer_field
+        base_text = "Previewing data row 1"
+        if selected_field:
+            base_text = f"{base_text} - Field selected: {selected_field}"
+        label.setText(base_text)
+        tooltip = f"Showing values from the first row of the dataset{sheet}."
+        if selected_field:
+            tooltip += f" Field '{selected_field}' is ready for column assignment."
+        label.setToolTip(tooltip)
+
+    def _on_field_selection_changed(self, field_name: Optional[str]) -> None:
+        self._selected_viewer_field = field_name or None
+        if field_name is None:
+            self.spreadsheet_panel.columns_widget.clearSelection()
+        self._update_preview_data_indicator()
+
+    def _on_column_activated(self, column_name: str) -> None:
+        if not self._selected_viewer_field:
+            return
+        field_name = self._selected_viewer_field
+        self._on_field_assigned(field_name, column_name)
+        self._set_status(f"Assigned column '{column_name}' to '{field_name}'", timeout=3000)
+
     def _show_about_dialog(self) -> None:
         QtWidgets.QMessageBox.about(
             self,
@@ -1948,7 +2368,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._state.data_sample is not None:
             available_columns = list(self._state.data_sample.columns())
         rule = self._state.mapping.resolve(field)
-        dialog = RuleEditorDialog(field, rule, available_fields, available_columns, self)
+        remove_callback = None
+        if field in self._state.mapping.rules:
+            remove_callback = lambda f=field: self._action_remove_mapping(f)
+        dialog = RuleEditorDialog(
+            field,
+            rule,
+            available_fields,
+            available_columns,
+            self,
+            remove_callback=remove_callback,
+        )
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             updated_rule = dialog.selected_rule()
             self._state.mapping.assign(field, updated_rule)
@@ -1962,7 +2392,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if field in self._state.mapping.rules:
             self._state.mapping.remove(field)
             self._refresh_mapping_labels()
+            self.pdf_viewer.clear_field_selection()
             self._update_data_actions()
+            self._update_preview_data_indicator()
             self._set_status(f"Removed mapping for '{field}'", timeout=4000)
 
     def _configure_page_controls_for_template(self) -> None:
@@ -2158,6 +2590,7 @@ class MainWindow(QtWidgets.QMainWindow):
             palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, disabled_text)
 
         app.setPalette(palette)
+        self._apply_tooltip_style(theme)
         self._repolish_for_theme()
 
     def _repolish_for_theme(self) -> None:
@@ -2177,6 +2610,56 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(widget, "viewport"):
                 widget.viewport().update()
             widget.repaint()
+
+    def _apply_tooltip_style(self, theme: Theme) -> None:
+        if not hasattr(self, "_tooltip_styler") or self._tooltip_styler is None:
+            self._tooltip_styler = TooltipStyler(self)
+
+        if theme == Theme.DARK:
+            background = "#262b34"
+            text = "#f5f5f8"
+            shadow_color = QtGui.QColor(0, 0, 0, 160)
+        else:
+            background = "#ffffff"
+            text = "#1f1f23"
+            shadow_color = QtGui.QColor(31, 31, 35, 100)
+
+        border_color = QtGui.QColor(background)
+        border_color.setAlphaF(0.8)
+
+        tooltip_stylesheet = (
+            "QToolTip {"
+            f" color: {text};"
+            f" background-color: {background};"
+            f" border: 1px solid {border_color.name(QtGui.QColor.HexArgb)};"
+            " border-radius: 2px;"
+            " padding: 2px 4px;"
+            "}"
+        )
+
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+
+        existing = app.styleSheet() or ""
+        cleaned = re.sub(r"QToolTip\s*\{[^}]*\}", "", existing, flags=re.DOTALL).strip()
+        if cleaned:
+            cleaned = f"{cleaned}\n"
+        app.setStyleSheet(f"{cleaned}{tooltip_stylesheet}")
+
+        self._tooltip_styler.update_theme(
+            background=background,
+            text=text,
+            border=border_color,
+            shadow=shadow_color,
+        )
+        if hasattr(self, '_tooltip_manager') and self._tooltip_manager is not None:
+            self._tooltip_manager.update_theme(
+                background=background,
+                text=text,
+                border=border_color,
+                shadow=shadow_color,
+            )
 
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -384,14 +384,17 @@ class RuleEditorDialog(QtWidgets.QDialog):
         available_fields: Sequence[str],
         available_columns: Sequence[str],
         parent: QtWidgets.QWidget | None = None,
+        *,
+        remove_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Edit Mapping Rule — {field_name}")
+        self.setWindowTitle(f"Edit Mapping Rule - {field_name}")
         self.resize(540, 480)
 
         self._field_name = field_name
         self._available_fields = list(available_fields)
         self._available_columns = list(available_columns)
+        self._remove_callback = remove_callback
 
         self._types_combo = QtWidgets.QComboBox()
         self._types_combo.addItem("Direct value", RuleType.VALUE)
@@ -462,7 +465,7 @@ class RuleEditorDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(targets_group)
         layout.addWidget(type_group, 1)
-        layout.addWidget(self._build_buttons())
+        layout.addWidget(self._build_buttons(include_remove=remove_callback is not None))
 
         initial_rule = rule or MappingRule.from_direct_column(
             field_name,
@@ -470,14 +473,41 @@ class RuleEditorDialog(QtWidgets.QDialog):
         )
         self._load_rule(initial_rule)
 
-    def _build_buttons(self) -> QtWidgets.QWidget:
+    def _build_buttons(self, *, include_remove: bool) -> QtWidgets.QWidget:
         button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         container = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        if include_remove:
+            remove_button = QtWidgets.QPushButton("Remove Mapping")
+            remove_button.setObjectName("removeMappingButton")
+            remove_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_TrashIcon))
+            remove_button.setAutoDefault(False)
+            remove_button.clicked.connect(self._handle_remove_clicked)
+            layout.addWidget(remove_button)
+            layout.addStretch(1)
+        else:
+            layout.addStretch(1)
         layout.addWidget(button_box)
         return container
+
+    def _handle_remove_clicked(self) -> None:
+        if self._remove_callback is None:
+            return
+        response = QtWidgets.QMessageBox.question(
+            self,
+            "Remove Mapping",
+            f"Remove mapping for '{self._field_name}'?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if response != QtWidgets.QMessageBox.Yes:
+            return
+        self._remove_callback()
+        self.reject()
 
     def _load_rule(self, rule: MappingRule) -> None:
         selected_targets = rule.targets or [rule.name]
