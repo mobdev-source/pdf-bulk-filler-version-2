@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -27,6 +27,22 @@ RULE_HELP_TEXT: dict[RuleType, str] = {
         "to change order, and choose a separator. Empty values are skipped by default."
     ),
 }
+
+
+class _AutoSizingStack(QtWidgets.QStackedWidget):
+    """Stacked widget that resizes to the currently visible page."""
+
+    def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
+        current = self.currentWidget()
+        if current is not None:
+            return current.sizeHint()
+        return super().sizeHint()
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # type: ignore[override]
+        current = self.currentWidget()
+        if current is not None:
+            return current.minimumSizeHint()
+        return super().minimumSizeHint()
 
 
 class _TargetsSelector(QtWidgets.QListWidget):
@@ -90,14 +106,21 @@ class _ValueConfigWidget(QtWidgets.QWidget):
         self._column_combo.blockSignals(False)
 
     def load_options(self, options: Dict[str, str]) -> None:
-        column = options.get("column", "")
+        column_value = options.get("column")
+        column = column_value if isinstance(column_value, str) else ""
         index = self._column_combo.findText(column)
         if index >= 0:
             self._column_combo.setCurrentIndex(index)
         elif self._column_combo.count():
             self._column_combo.setCurrentIndex(0)
-        self._default_edit.setText(options.get("default", ""))
-        self._format_edit.setText(options.get("format", ""))
+        default_value = options.get("default", "")
+        if not isinstance(default_value, str):
+            default_value = ""
+        format_value = options.get("format", "")
+        if not isinstance(format_value, str):
+            format_value = ""
+        self._default_edit.setText(default_value)
+        self._format_edit.setText(format_value)
 
     def build_options(self) -> Dict[str, str]:
         return {
@@ -105,6 +128,9 @@ class _ValueConfigWidget(QtWidgets.QWidget):
             "default": self._default_edit.text(),
             "format": self._format_edit.text(),
         }
+
+    def current_column(self) -> str:
+        return self._column_combo.currentText()
 
 
 class _LiteralConfigWidget(QtWidgets.QWidget):
@@ -169,19 +195,38 @@ class _ConcatConfigWidget(QtWidgets.QWidget):
         layout.addWidget(settings_panel, 4)
 
     def _populate_columns(self, selected: Iterable[str] | None = None) -> None:
-        selected_set = {str(name) for name in selected or []}
+        selected_list = [str(name) for name in selected or [] if name]
+        selected_seen: set[str] = set()
+        available_set = {str(column) for column in self._columns}
+
         self._column_list.clear()
-        for column in self._columns:
-            item = QtWidgets.QListWidgetItem(column)
-            item.setFlags(
-                QtCore.Qt.ItemIsEnabled
-                | QtCore.Qt.ItemIsSelectable
-                | QtCore.Qt.ItemIsUserCheckable
-                | QtCore.Qt.ItemIsDragEnabled
-            )
-            state = QtCore.Qt.Checked if column in selected_set else QtCore.Qt.Unchecked
-            item.setCheckState(state)
+
+        def _add_item(column_name: str, *, checked: bool, enabled: bool = True) -> None:
+            item = QtWidgets.QListWidgetItem(column_name)
+            flags = QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsUserCheckable
+            if enabled:
+                flags |= QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsDragEnabled
+            item.setFlags(flags)
+            item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+            if not enabled:
+                item.setForeground(QtGui.QColor(QtCore.Qt.GlobalColor.gray))
             self._column_list.addItem(item)
+
+        # Preserve the user-defined ordering for selected columns first.
+        for column in selected_list:
+            if column in selected_seen:
+                continue
+            if column in available_set:
+                _add_item(column, checked=True, enabled=True)
+            else:
+                _add_item(column, checked=True, enabled=False)
+            selected_seen.add(column)
+
+        # Append the remaining available columns in their default order.
+        for column in self._columns:
+            if column in selected_seen:
+                continue
+            _add_item(column, checked=column in selected_seen, enabled=True)
 
     def set_columns(self, columns: Sequence[str]) -> None:
         selected = self.selected_columns()
@@ -217,83 +262,422 @@ class _ConcatConfigWidget(QtWidgets.QWidget):
         return columns
 
 
+class _ChoiceTargetActionEditor(QtWidgets.QWidget):
+    """Editor for configuring how a single PDF target reacts within a case."""
+
+    changed = QtCore.Signal()
+
+    _CHECKBOX_TRUE_VALUES = {"yes", "true", "on", "1", "checked"}
+    _CHECKBOX_FALSE_VALUES = {"no", "false", "off", "0", "unchecked"}
+
+    def __init__(self, target: str, columns: Sequence[str], parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._target = target
+        self._columns = list(columns)
+        self._block_updates = False
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
+
+        self._mode_combo = QtWidgets.QComboBox()
+        self._mode_combo.addItem("Leave unchanged", "ignore")
+        self._mode_combo.addItem("Check the box", "checked")
+        self._mode_combo.addItem("Uncheck the box", "unchecked")
+        self._mode_combo.addItem("Use literal text", "literal")
+        self._mode_combo.addItem("Use column value", "column")
+
+        self._text_edit = QtWidgets.QLineEdit()
+        self._text_edit.setPlaceholderText("Enter the text to use")
+
+        self._column_combo = QtWidgets.QComboBox()
+        self._column_combo.addItems(self._columns)
+        self._column_combo.setEditable(False)
+        self._column_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self._column_combo.setMinimumContentsLength(1)
+        self._column_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        self._column_fallback = QtWidgets.QLineEdit()
+        self._column_fallback.setPlaceholderText("Fallback when column is empty (optional)")
+        self._column_fallback.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        self._stack = _AutoSizingStack()
+        self._stack.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self._stack.addWidget(QtWidgets.QWidget())
+
+        text_page = QtWidgets.QWidget()
+        text_layout = QtWidgets.QVBoxLayout(text_page)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(4)
+        text_layout.addWidget(self._text_edit)
+        text_page.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self._stack.addWidget(text_page)
+
+        column_page = QtWidgets.QWidget()
+        column_layout = QtWidgets.QVBoxLayout(column_page)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(4)
+        column_layout.addWidget(self._column_combo)
+        column_layout.addWidget(self._column_fallback)
+        column_page.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self._stack.addWidget(column_page)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self._mode_combo)
+        layout.addWidget(self._stack)
+
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self._text_edit.textEdited.connect(self._emit_changed)
+        self._column_combo.currentIndexChanged.connect(self._emit_changed)
+        self._column_fallback.textEdited.connect(self._emit_changed)
+        self._on_mode_changed(self._mode_combo.currentIndex())
+
+    def set_columns(self, columns: Sequence[str]) -> None:
+        current = self._column_combo.currentText()
+        self._columns = list(columns)
+        self._column_combo.blockSignals(True)
+        self._column_combo.clear()
+        self._column_combo.addItems(self._columns)
+        index = self._column_combo.findText(current)
+        if index >= 0:
+            self._column_combo.setCurrentIndex(index)
+        self._column_combo.blockSignals(False)
+
+    def load_action(self, action: Any) -> None:
+        self._block_updates = True
+        mode = "ignore"
+        literal_value = ""
+        column = ""
+        fallback = ""
+
+        if isinstance(action, Mapping):
+            mode = str(action.get("mode") or action.get("kind") or action.get("type") or "").lower()
+            if not mode:
+                if "column" in action:
+                    mode = "column"
+                elif "checked" in action:
+                    mode = "checkbox"
+                elif "value" in action:
+                    mode = "literal"
+            if mode == "column":
+                column = str(action.get("column", ""))
+                fallback = str(action.get("fallback", ""))
+            elif mode in {"literal", "text", "value"}:
+                mode = "literal"
+                literal_value = str(action.get("value", ""))
+            elif mode == "checkbox":
+                mode = "checked" if bool(action.get("checked", True)) else "unchecked"
+            elif mode == "raw":
+                mode = "literal"
+                literal_value = str(action.get("value", ""))
+        elif isinstance(action, bool):
+            mode = "checked" if action else "unchecked"
+        elif isinstance(action, str):
+            normalized = action.strip()
+            lowered = normalized.lower()
+            if lowered in self._CHECKBOX_TRUE_VALUES or normalized.startswith("/"):
+                mode = "checked"
+            elif lowered in self._CHECKBOX_FALSE_VALUES:
+                mode = "unchecked"
+            else:
+                mode = "literal"
+                literal_value = normalized
+        elif action is not None:
+            mode = "literal"
+            literal_value = str(action)
+
+        index = self._mode_combo.findData(mode)
+        if index < 0:
+            index = 0
+        self._mode_combo.setCurrentIndex(index)
+
+        if mode == "literal":
+            self._text_edit.setText(literal_value)
+        else:
+            self._text_edit.clear()
+
+        if mode == "column":
+            self._column_combo.blockSignals(True)
+            if column:
+                combo_index = self._column_combo.findText(column)
+                if combo_index >= 0:
+                    self._column_combo.setCurrentIndex(combo_index)
+                else:
+                    self._column_combo.insertItem(0, column)
+                    self._column_combo.setCurrentIndex(0)
+            else:
+                if self._column_combo.count():
+                    self._column_combo.setCurrentIndex(0)
+            self._column_combo.blockSignals(False)
+            self._column_fallback.setText(fallback)
+        else:
+            if self._column_combo.count():
+                self._column_combo.setCurrentIndex(0)
+            self._column_fallback.clear()
+
+        self._block_updates = False
+        self._on_mode_changed(self._mode_combo.currentIndex())
+
+    def clear(self) -> None:
+        self.load_action(None)
+
+    def action_spec(self) -> Dict[str, Any] | None:
+        mode = self._mode_combo.currentData()
+        if mode == "ignore":
+            return None
+        if mode == "checked":
+            return {"mode": "checkbox", "checked": True}
+        if mode == "unchecked":
+            return {"mode": "checkbox", "checked": False}
+        if mode == "literal":
+            return {"mode": "literal", "value": self._text_edit.text()}
+        if mode == "column":
+            column = self._column_combo.currentText().strip()
+            data: Dict[str, Any] = {"mode": "column"}
+            if column:
+                data["column"] = column
+            fallback = self._column_fallback.text()
+            if fallback:
+                data["fallback"] = fallback
+            return data
+        return None
+
+    def _on_mode_changed(self, index: int) -> None:
+        mode = self._mode_combo.itemData(index)
+        if mode == "literal":
+            self._stack.setCurrentIndex(1)
+        elif mode == "column":
+            self._stack.setCurrentIndex(2)
+        else:
+            self._stack.setCurrentIndex(0)
+        if not self._block_updates:
+            self._emit_changed()
+
+    def _emit_changed(self) -> None:
+        if not self._block_updates:
+            self.changed.emit()
+
+
+class _ChoiceCaseEditor(QtWidgets.QWidget):
+    """Composite editor for a single conditional case."""
+
+    changed = QtCore.Signal()
+
+    def __init__(
+        self,
+        columns: Sequence[str],
+        targets: Sequence[str],
+        *,
+        include_match_field: bool,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._include_match_field = include_match_field
+        self._columns = list(columns)
+        self._targets = list(targets)
+        self._block_updates = False
+
+        layout = QtWidgets.QFormLayout(self)
+        layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
+        layout.setVerticalSpacing(6)
+        layout.setHorizontalSpacing(12)
+        layout.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+        self._match_edit: QtWidgets.QLineEdit | None = None
+        if include_match_field:
+            self._match_edit = QtWidgets.QLineEdit()
+            self._match_edit.setPlaceholderText("Value to match")
+            self._match_edit.textEdited.connect(self._emit_changed)
+            layout.addRow("Match value:", self._match_edit)
+
+        self._targets_group = QtWidgets.QGroupBox("Field actions")
+        targets_layout = QtWidgets.QFormLayout(self._targets_group)
+        targets_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
+        targets_layout.setVerticalSpacing(4)
+        targets_layout.setHorizontalSpacing(10)
+        targets_layout.setContentsMargins(8, 6, 8, 6)
+        targets_layout.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+        self._target_editors: Dict[str, _ChoiceTargetActionEditor] = {}
+        for target in self._targets:
+            editor = _ChoiceTargetActionEditor(target, self._columns)
+            editor.changed.connect(self._emit_changed)
+            targets_layout.addRow(f"{target}:", editor)
+            self._target_editors[target] = editor
+
+        layout.addRow(self._targets_group)
+
+    def set_columns(self, columns: Sequence[str]) -> None:
+        self._columns = list(columns)
+        for editor in self._target_editors.values():
+            editor.set_columns(self._columns)
+
+    def set_targets(self, targets: Sequence[str]) -> None:
+        stored_actions = self.actions()
+        self._targets = list(targets)
+        layout = self._targets_group.layout()
+        assert isinstance(layout, QtWidgets.QFormLayout)
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self._target_editors = {}
+        for target in self._targets:
+            editor = _ChoiceTargetActionEditor(target, self._columns)
+            editor.changed.connect(self._emit_changed)
+            layout.addRow(f"{target}:", editor)
+            if target in stored_actions:
+                editor.load_action(stored_actions[target])
+            self._target_editors[target] = editor
+
+    def load_case(self, case: Mapping[str, Any] | None) -> None:
+        self._block_updates = True
+        if self._match_edit is not None:
+            value = ""
+            if case is not None:
+                value = str(case.get("match", ""))
+            self._match_edit.setText(value)
+        outputs: Mapping[str, Any] = {}
+        if case is not None:
+            payload = case.get("outputs", {})
+            if isinstance(payload, Mapping):
+                outputs = payload
+        for target, editor in self._target_editors.items():
+            editor.load_action(outputs.get(target))
+        self._block_updates = False
+
+    def actions(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for target, editor in self._target_editors.items():
+            spec = editor.action_spec()
+            if spec is not None:
+                result[target] = spec
+        return result
+
+    def case_data(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"outputs": self.actions()}
+        if self._match_edit is not None:
+            payload["match"] = self._match_edit.text().strip()
+        return payload
+
+    def clear(self) -> None:
+        self.load_case(None)
+
+    def _emit_changed(self) -> None:
+        if not self._block_updates:
+            self.changed.emit()
+
+
 class _ChoiceConfigWidget(QtWidgets.QWidget):
     """Configuration panel for conditional mappings."""
 
     def __init__(self, columns: Sequence[str], targets: Sequence[str], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._all_columns = list(columns)
-        self._targets: list[str] = list(targets)
-        self._default_fields: Dict[str, QtWidgets.QLineEdit] = {}
+        self._targets = list(targets)
+        self._cases: list[Dict[str, Any]] = []
+        self._current_case_index = -1
+        self._loading_case = False
 
         self._source_combo = QtWidgets.QComboBox()
         self._source_combo.addItems(self._all_columns)
 
-        self._cases_table = QtWidgets.QTableWidget(0, 1)
-        self._cases_table.setHorizontalHeaderLabels(["Match Value"])
-        self._cases_table.horizontalHeader().setStretchLastSection(True)
-        self._cases_table.setEditTriggers(QtWidgets.QAbstractItemView.AllEditTriggers)
-
-        self._add_case_button = QtWidgets.QPushButton("Add Case")
-        self._remove_case_button = QtWidgets.QPushButton("Remove Selected")
-
-        self._add_case_button.clicked.connect(self._add_case)
-        self._remove_case_button.clicked.connect(self._remove_case)
-
-        button_row = QtWidgets.QHBoxLayout()
-        button_row.addWidget(self._add_case_button)
-        button_row.addWidget(self._remove_case_button)
-        button_row.addStretch(1)
-
         instructions = QtWidgets.QLabel(
-            "Add a row for each possible value in the data column, then specify what each PDF field "
-            "should display for that value."
+            "Define how each value from the data column should toggle checkboxes or fill text fields."
         )
+        instructions.setObjectName("choiceInstructions")
         instructions.setWordWrap(True)
 
-        self._default_layout = QtWidgets.QFormLayout()
+        self._cases_list = QtWidgets.QListWidget()
+        self._cases_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._cases_list.setUniformItemSizes(True)
+        self._cases_list.currentRowChanged.connect(self._on_case_selected)
+
+        self._case_editor = _ChoiceCaseEditor(self._all_columns, self._targets, include_match_field=True)
+        self._case_editor.changed.connect(self._on_case_changed)
+
+        cases_panel = QtWidgets.QWidget()
+        cases_layout = QtWidgets.QHBoxLayout(cases_panel)
+        cases_layout.setContentsMargins(0, 0, 0, 0)
+        cases_layout.setSpacing(8)
+        cases_layout.addWidget(self._cases_list, 2)
+        cases_layout.addWidget(self._case_editor, 5)
+        cases_panel.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.MinimumExpanding)
+
+        self._add_case_button = QtWidgets.QPushButton("Add value")
+        self._remove_case_button = QtWidgets.QPushButton("Remove value")
+        self._add_case_button.clicked.connect(self._handle_add_case)
+        self._remove_case_button.clicked.connect(self._handle_remove_case)
+
+        buttons_row = QtWidgets.QHBoxLayout()
+        buttons_row.setSpacing(6)
+        buttons_row.addWidget(self._add_case_button)
+        buttons_row.addWidget(self._remove_case_button)
+        buttons_row.addStretch(1)
+
+        self._fallback_editor = _ChoiceCaseEditor(
+            self._all_columns,
+            self._targets,
+            include_match_field=False,
+        )
+        self._fallback_editor.changed.connect(self._on_case_changed)
+
+        fallback_group = QtWidgets.QGroupBox("When no value matches")
+        fallback_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        fallback_layout = QtWidgets.QVBoxLayout(fallback_group)
+        fallback_layout.setContentsMargins(8, 8, 8, 8)
+        fallback_layout.setSpacing(6)
+        fallback_hint = QtWidgets.QLabel("Optional actions to apply when no case is triggered.")
+        fallback_hint.setWordWrap(True)
+        fallback_layout.addWidget(fallback_hint)
+        fallback_layout.addWidget(self._fallback_editor)
+
+        scroll_content = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(10)
+        scroll_layout.addWidget(instructions)
+        scroll_layout.addWidget(cases_panel, 1)
+        scroll_layout.addLayout(buttons_row)
+        scroll_layout.addWidget(fallback_group)
+        scroll_layout.addStretch(1)
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setObjectName("choiceScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_area.setWidget(scroll_content)
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(QtWidgets.QLabel("Source column:"))
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        source_label = QtWidgets.QLabel("Source column:")
+        layout.addWidget(source_label)
         layout.addWidget(self._source_combo)
-        layout.addWidget(instructions)
-        layout.addLayout(button_row)
-        layout.addWidget(self._cases_table, 4)
-        defaults_group = QtWidgets.QGroupBox("Default outputs")
-        defaults_group.setLayout(self._default_layout)
-        layout.addWidget(defaults_group)
+        layout.addWidget(scroll_area)
 
-        self.set_targets(targets)
-        self.set_columns(columns)
+        self._ensure_case_exists()
 
     def set_targets(self, targets: Sequence[str]) -> None:
-        existing_cases = self._collect_cases()
-        existing_defaults = {name: field.text() for name, field in self._default_fields.items()}
+        self._sync_current_case()
         self._targets = list(targets)
-        column_labels = ["Match Value"] + list(self._targets)
-        self._cases_table.setColumnCount(len(column_labels))
-        self._cases_table.setHorizontalHeaderLabels(column_labels)
-        self._cases_table.horizontalHeader().setStretchLastSection(True)
-
-        self._cases_table.setRowCount(len(existing_cases))
-        for row_index, case in enumerate(existing_cases):
-            match_value = case.get("match", "")
-            self._cases_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(match_value))
+        for case in self._cases:
             outputs = case.get("outputs", {})
-            for column_offset, target in enumerate(self._targets, start=1):
-                value = outputs.get(target, "")
-                self._cases_table.setItem(row_index, column_offset, QtWidgets.QTableWidgetItem(value))
-
-        for i in reversed(range(self._default_layout.count())):
-            item = self._default_layout.takeAt(i)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
-        self._default_fields = {}
-        for target in self._targets:
-            edit = QtWidgets.QLineEdit(existing_defaults.get(target, ""))
-            self._default_layout.addRow(f"{target}:", edit)
-            self._default_fields[target] = edit
+            if isinstance(outputs, Mapping):
+                case["outputs"] = {key: outputs[key] for key in outputs if key in self._targets}
+            else:
+                case["outputs"] = {}
+        fallback_outputs = self._fallback_editor.actions()
+        self._case_editor.set_targets(self._targets)
+        self._fallback_editor.set_targets(self._targets)
+        self._fallback_editor.load_case({"outputs": fallback_outputs})
+        self._refresh_case_list()
+        if 0 <= self._current_case_index < len(self._cases):
+            self._loading_case = True
+            self._case_editor.load_case(self._cases[self._current_case_index])
+            self._loading_case = False
+        elif self._cases:
+            self._cases_list.setCurrentRow(0)
 
     def set_columns(self, columns: Sequence[str]) -> None:
         current = self._source_combo.currentText()
@@ -304,76 +688,304 @@ class _ChoiceConfigWidget(QtWidgets.QWidget):
         if index >= 0:
             self._source_combo.setCurrentIndex(index)
         self._source_combo.blockSignals(False)
+        self._all_columns = list(columns)
+        self._case_editor.set_columns(self._all_columns)
+        self._fallback_editor.set_columns(self._all_columns)
 
-    def load_options(self, options: Dict[str, object]) -> None:
-        source = str(options.get("source", ""))
-        index = self._source_combo.findText(source)
-        if index >= 0:
-            self._source_combo.setCurrentIndex(index)
-        cases = options.get("cases", {})
-        if isinstance(cases, dict):
-            parsed_cases = []
-            for match_value, outputs in cases.items():
-                row_outputs = {}
-                if isinstance(outputs, dict):
-                    for target in self._targets:
-                        row_outputs[target] = str(outputs.get(target, ""))
+    def load_options(self, options: Dict[str, object], *, default_source: str | None = None) -> None:
+        source_value = options.get("source")
+        source = source_value if isinstance(source_value, str) else ""
+        if not source and default_source:
+            source = default_source
+        if source:
+            index = self._source_combo.findText(source)
+            if index >= 0:
+                self._source_combo.setCurrentIndex(index)
+            else:
+                self._source_combo.insertItem(0, source)
+                self._source_combo.setCurrentIndex(0)
+        elif self._source_combo.count() and self._source_combo.currentIndex() < 0:
+            self._source_combo.setCurrentIndex(0)
+
+        cases_payload = options.get("cases")
+        parsed_cases: list[Dict[str, Any]] = []
+        if isinstance(cases_payload, Mapping):
+            for match_value, outputs in cases_payload.items():
+                parsed_cases.append(
+                    {
+                        "match": str(match_value),
+                        "outputs": self._normalize_outputs(outputs),
+                    }
+                )
+        elif isinstance(cases_payload, list):
+            for case in cases_payload:
+                if isinstance(case, Mapping):
+                    parsed_cases.append(
+                        {
+                            "match": str(case.get("match", "")),
+                            "outputs": self._normalize_outputs(case.get("outputs", {})),
+                        }
+                    )
+        elif not cases_payload:
+            case_map = options.get("case_map")
+            if isinstance(case_map, Mapping):
+                for match_value, outputs in case_map.items():
+                    parsed_cases.append(
+                        {
+                            "match": str(match_value),
+                            "outputs": self._normalize_outputs(outputs),
+                        }
+                    )
+        case_map = options.get("case_map")
+        if isinstance(case_map, Mapping) and case_map:
+            existing = [str(case.get("match", "")).strip() for case in parsed_cases]
+            blanks = [case for case in parsed_cases if not str(case.get("match", "")).strip()]
+            for match_value, outputs in case_map.items():
+                key = str(match_value).strip()
+                if not key:
+                    continue
+                if key in existing:
+                    continue
+                if blanks:
+                    slot = blanks.pop(0)
+                    slot["match"] = key
+                    slot["outputs"] = self._normalize_outputs(outputs)
+                    existing.append(key)
                 else:
-                    row_outputs = {target: str(outputs) for target in self._targets}
-                parsed_cases.append({"match": str(match_value), "outputs": row_outputs})
-            self._cases_table.setRowCount(len(parsed_cases))
-            for row_index, case in enumerate(parsed_cases):
-                self._cases_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(case["match"]))
-                for column_offset, target in enumerate(self._targets, start=1):
-                    value = case["outputs"].get(target, "")
-                    self._cases_table.setItem(row_index, column_offset, QtWidgets.QTableWidgetItem(value))
-        defaults = options.get("default", {})
-        if isinstance(defaults, dict):
-            for target, edit in self._default_fields.items():
-                edit.setText(str(defaults.get(target, "")))
+                    parsed_cases.append(
+                        {
+                            "match": key,
+                            "outputs": self._normalize_outputs(outputs),
+                        }
+                    )
+                    existing.append(key)
+        self._cases = parsed_cases or []
+        self._refresh_case_list()
+        if self._cases:
+            self._cases_list.setCurrentRow(0)
+        else:
+            self._ensure_case_exists()
+
+        default_payload = options.get("default", {})
+        if isinstance(default_payload, Mapping):
+            self._fallback_editor.load_case({"outputs": self._normalize_outputs(default_payload)})
+        else:
+            self._fallback_editor.clear()
 
     def build_options(self) -> Dict[str, object]:
-        cases = {}
-        for case in self._collect_cases():
-            match_value = case.get("match", "")
+        self._sync_current_case()
+        cases_map: Dict[str, Dict[str, Any]] = {}
+        cases_list: list[Dict[str, Any]] = []
+        for case in self._cases:
+            match_value = str(case.get("match", "")).strip()
             if not match_value:
                 continue
-            cases[match_value] = {
-                target: case["outputs"].get(target, "")
-                for target in self._targets
-            }
-        defaults = {target: edit.text() for target, edit in self._default_fields.items()}
-        return {
+            outputs: Dict[str, Any] = {}
+            for target, action in (case.get("outputs") or {}).items():
+                simplified = self._simplify_action(action)
+                if simplified is not None:
+                    outputs[str(target)] = simplified
+            cases_list.append({"match": match_value, "outputs": outputs})
+            cases_map[match_value] = outputs
+
+        default_outputs: Dict[str, Any] = {}
+        for target, action in self._fallback_editor.actions().items():
+            simplified = self._simplify_action(action)
+            if simplified is not None:
+                default_outputs[target] = simplified
+
+        payload: Dict[str, object] = {
             "source": self._source_combo.currentText(),
-            "cases": cases,
-            "default": defaults,
         }
+        if cases_list:
+            payload["cases"] = cases_list
+            payload["case_map"] = cases_map
+        else:
+            payload["cases"] = {}
+        if default_outputs:
+            payload["default"] = default_outputs
+        return payload
 
-    def _collect_cases(self) -> List[Dict[str, object]]:
-        data: List[Dict[str, object]] = []
-        for row in range(self._cases_table.rowCount()):
-            match_item = self._cases_table.item(row, 0)
-            match_value = match_item.text() if match_item else ""
-            outputs: Dict[str, str] = {}
-            for column_offset, target in enumerate(self._targets, start=1):
-                cell = self._cases_table.item(row, column_offset)
-                outputs[target] = cell.text() if cell else ""
-            data.append({"match": match_value, "outputs": outputs})
-        return data
+    def ensure_source_selected(self, preferred: str | None = None) -> None:
+        if self._source_combo.currentIndex() >= 0 and self._source_combo.currentText():
+            return
+        candidate = preferred or ""
+        if candidate:
+            index = self._source_combo.findText(candidate)
+            if index >= 0:
+                self._source_combo.setCurrentIndex(index)
+                return
+        if self._source_combo.count():
+            self._source_combo.setCurrentIndex(0)
 
-    def _add_case(self) -> None:
-        row = self._cases_table.rowCount()
-        self._cases_table.insertRow(row)
-        self._cases_table.setItem(row, 0, QtWidgets.QTableWidgetItem(""))
-        for column_offset in range(1, len(self._targets) + 1):
-            self._cases_table.setItem(row, column_offset, QtWidgets.QTableWidgetItem(""))
+    def validate(self) -> tuple[bool, str | None]:
+        self._sync_current_case()
+        for case in self._cases:
+            match_value = str(case.get("match", "")).strip()
+            if not match_value:
+                return False, "Enter a match value for each conditional choice."
+            outputs = case.get("outputs", {})
+            if not outputs:
+                return False, f"Add at least one field action for '{match_value}'."
+            for target, action in outputs.items():
+                if isinstance(action, Mapping):
+                    mode = str(action.get("mode") or action.get("kind") or action.get("type") or "").lower()
+                    if not mode and "column" in action:
+                        mode = "column"
+                    if mode == "column" and not str(action.get("column", "")).strip():
+                        return False, f"Select a column for '{target}' when '{match_value}' is matched."
+        for target, action in self._fallback_editor.actions().items():
+            if isinstance(action, Mapping):
+                mode = str(action.get("mode") or action.get("kind") or action.get("type") or "").lower()
+                if not mode and "column" in action:
+                    mode = "column"
+                if mode == "column" and not str(action.get("column", "")).strip():
+                    return False, f"Select a column for '{target}' in the fallback configuration."
+        return True, None
 
-    def _remove_case(self) -> None:
-        row = self._cases_table.currentRow()
-        if row >= 0:
-            self._cases_table.removeRow(row)
+    def _ensure_case_exists(self) -> None:
+        if not self._cases:
+            self._cases.append({"match": "", "outputs": {}})
+            self._refresh_case_list()
+            self._cases_list.setCurrentRow(0)
 
+    def _refresh_case_list(self) -> None:
+        self._cases_list.blockSignals(True)
+        self._cases_list.clear()
+        for case in self._cases:
+            self._cases_list.addItem(self._format_case_label(case))
+        self._cases_list.blockSignals(False)
+        if 0 <= self._current_case_index < len(self._cases):
+            self._cases_list.setCurrentRow(self._current_case_index)
+        else:
+            self._current_case_index = self._cases_list.currentRow()
 
+    def _format_case_label(self, case: Mapping[str, Any]) -> str:
+        match_value = str(case.get("match", "")).strip()
+        if match_value:
+            return match_value
+        outputs = case.get("outputs", {})
+        if outputs:
+            return ", ".join(str(target) for target in outputs.keys())
+        return "New value"
+
+    def _on_case_selected(self, index: int) -> None:
+        if self._loading_case:
+            return
+        if 0 <= self._current_case_index < len(self._cases):
+            self._cases[self._current_case_index] = self._case_editor.case_data()
+            self._update_case_label(self._current_case_index)
+        self._current_case_index = index
+        self._loading_case = True
+        if 0 <= index < len(self._cases):
+            self._case_editor.load_case(self._cases[index])
+        else:
+            self._case_editor.clear()
+        self._loading_case = False
+
+    def _on_case_changed(self) -> None:
+        if self._loading_case or not (0 <= self._current_case_index < len(self._cases)):
+            return
+        self._cases[self._current_case_index] = self._case_editor.case_data()
+        self._update_case_label(self._current_case_index)
+
+    def _update_case_label(self, index: int) -> None:
+        if 0 <= index < self._cases_list.count():
+            self._cases_list.item(index).setText(self._format_case_label(self._cases[index]))
+
+    def _sync_current_case(self) -> None:
+        self._on_case_changed()
+
+    def _handle_add_case(self) -> None:
+        self._sync_current_case()
+        self._cases.append({"match": "", "outputs": {}})
+        self._refresh_case_list()
+        self._cases_list.setCurrentRow(len(self._cases) - 1)
+
+    def _handle_remove_case(self) -> None:
+        index = self._cases_list.currentRow()
+        if index < 0:
+            return
+        self._cases.pop(index)
+        if not self._cases:
+            self._cases.append({"match": "", "outputs": {}})
+        self._refresh_case_list()
+        new_index = min(index, len(self._cases) - 1)
+        self._cases_list.setCurrentRow(new_index)
+
+    def _simplify_action(self, action: Any) -> Any:
+        if not isinstance(action, Mapping):
+            return action
+        mode = str(action.get("mode") or action.get("kind") or action.get("type") or "").lower()
+        if not mode and "column" in action:
+            mode = "column"
+        if not mode and "value" in action:
+            mode = "literal"
+        if mode == "checkbox":
+            checked = action.get("checked")
+            if isinstance(checked, bool):
+                on_value = action.get("value") or action.get("checked_value") or action.get("on")
+                off_value = action.get("unchecked_value") or action.get("off")
+                if on_value is None and off_value is None:
+                    return checked
+                return on_value if checked else off_value
+            return bool(checked)
+        if mode in {"literal", "text", "value"}:
+            return action.get("value", "")
+        if mode == "column":
+            result: Dict[str, Any] = {"mode": "column"}
+            column = action.get("column")
+            if column:
+                result["column"] = column
+            fallback = action.get("fallback")
+            if fallback:
+                result["fallback"] = fallback
+            format_pattern = action.get("format")
+            if format_pattern:
+                result["format"] = format_pattern
+            return result
+        if mode == "raw":
+            return action.get("value")
+        return action
+
+    def _normalize_outputs(self, payload: Any) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        if isinstance(payload, Mapping):
+            for key, value in payload.items():
+                spec = self._normalize_action(value)
+                if spec:
+                    result[str(key)] = spec
+        return result
+
+    def _normalize_action(self, value: Any) -> Dict[str, Any]:
+        if isinstance(value, Mapping):
+            data = dict(value)
+            mode = str(data.get("mode") or data.get("kind") or data.get("type") or "").lower()
+            if not mode:
+                if "column" in data:
+                    mode = "column"
+                elif "checked" in data:
+                    mode = "checkbox"
+                elif "value" in data:
+                    mode = "literal"
+            result: Dict[str, Any] = {"mode": mode} if mode else {}
+            for key in ("column", "fallback", "format", "value", "checked", "checked_value", "unchecked_value", "on", "off"):
+                if key in data:
+                    result[key] = data[key]
+            return result
+        if isinstance(value, bool):
+            return {"mode": "checkbox", "checked": value}
+        if isinstance(value, str):
+            normalized = value.strip()
+            lowered = normalized.lower()
+            if lowered in _ChoiceTargetActionEditor._CHECKBOX_TRUE_VALUES or normalized.startswith("/"):
+                return {"mode": "checkbox", "checked": True}
+            if lowered in _ChoiceTargetActionEditor._CHECKBOX_FALSE_VALUES:
+                return {"mode": "checkbox", "checked": False}
+            return {"mode": "literal", "value": value}
+        if value is not None:
+            return {"mode": "literal", "value": value}
+        return {}
 class RuleEditorDialog(QtWidgets.QDialog):
     """Modal dialog that edits a mapping rule."""
 
@@ -389,7 +1001,7 @@ class RuleEditorDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Edit Mapping Rule - {field_name}")
-        self.resize(540, 480)
+        self.resize(920, 560)
 
         self._field_name = field_name
         self._available_fields = list(available_fields)
@@ -404,6 +1016,7 @@ class RuleEditorDialog(QtWidgets.QDialog):
 
         self._targets_list = _TargetsSelector()
         self._targets_list.setMinimumHeight(120)
+        self._targets_list.setMinimumWidth(220)
         self._targets_list.selectionChanged.connect(self._on_targets_changed)
 
         self._value_widget = _ValueConfigWidget(self._available_columns)
@@ -439,7 +1052,7 @@ class RuleEditorDialog(QtWidgets.QDialog):
         self._help_label.setObjectName("ruleHelpLabel")
         self._help_label.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
 
-        self._stack = QtWidgets.QStackedWidget()
+        self._stack = _AutoSizingStack()
         self._stack.addWidget(self._value_widget)
         self._stack.addWidget(self._literal_widget)
         self._stack.addWidget(self._choice_widget)
@@ -450,8 +1063,10 @@ class RuleEditorDialog(QtWidgets.QDialog):
         targets_group = QtWidgets.QGroupBox("PDF fields to populate")
         targets_layout = QtWidgets.QVBoxLayout(targets_group)
         targets_layout.addWidget(self._targets_list)
+        targets_group.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
 
         type_group = QtWidgets.QGroupBox("Rule configuration")
+        type_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         type_layout = QtWidgets.QVBoxLayout(type_group)
         type_layout.addWidget(self._types_combo)
         help_row = QtWidgets.QHBoxLayout()
@@ -462,9 +1077,17 @@ class RuleEditorDialog(QtWidgets.QDialog):
         type_layout.addLayout(help_row)
         type_layout.addWidget(self._stack, 1)
 
+        split_panel = QtWidgets.QWidget()
+        split_layout = QtWidgets.QHBoxLayout(split_panel)
+        split_layout.setContentsMargins(0, 0, 0, 0)
+        split_layout.setSpacing(16)
+        split_layout.addWidget(targets_group, 1)
+        split_layout.addWidget(type_group, 2)
+
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(targets_group)
-        layout.addWidget(type_group, 1)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
+        layout.addWidget(split_panel, 1)
         layout.addWidget(self._build_buttons(include_remove=remove_callback is not None))
 
         initial_rule = rule or MappingRule.from_direct_column(
@@ -525,7 +1148,18 @@ class RuleEditorDialog(QtWidgets.QDialog):
         self._concat_widget.load_options(rule.options)
         self._choice_widget.set_targets(selected_targets)
         self._choice_widget.set_columns(self._available_columns)
-        self._choice_widget.load_options(rule.options)
+        preferred_source = ""
+        source_option = rule.options.get("source")
+        if isinstance(source_option, str):
+            preferred_source = source_option
+        else:
+            column_option = rule.options.get("column")
+            if isinstance(column_option, str):
+                preferred_source = column_option
+        if not preferred_source:
+            preferred_source = self._value_widget.current_column()
+        self._choice_widget.load_options(rule.options, default_source=preferred_source)
+        self._choice_widget.ensure_source_selected(preferred_source)
         self._update_help(rule_type)
 
     def _on_targets_changed(self) -> None:
@@ -544,6 +1178,7 @@ class RuleEditorDialog(QtWidgets.QDialog):
         elif rule_type is RuleType.CHOICE:
             self._stack.setCurrentWidget(self._choice_widget)
             self._choice_widget.set_targets(self._targets_list.selected_targets() or [self._field_name])
+            self._choice_widget.ensure_source_selected(self._value_widget.current_column())
         elif rule_type is RuleType.CONCAT:
             self._stack.setCurrentWidget(self._concat_widget)
         self._update_help(rule_type)
@@ -600,6 +1235,14 @@ class RuleEditorDialog(QtWidgets.QDialog):
             source = str(options.get("source", "")).strip()
             if not source:
                 QtWidgets.QMessageBox.warning(self, "Validate Rule", "Select the source column for the conditional rule.")
+                return False
+            valid, message = self._choice_widget.validate()
+            if not valid:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Validate Rule",
+                    message or "Configure at least one conditional value.",
+                )
                 return False
         if rule_type is RuleType.CONCAT:
             columns = options.get("columns", [])

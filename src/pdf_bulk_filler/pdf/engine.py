@@ -151,7 +151,7 @@ class PdfEngine:
     def _write_interactive_pdf(
         self,
         template_path: Path,
-        payload: Dict[str, str],
+        payload: Dict[str, object],
         output_path: Path,
         *,
         read_only: bool = False,
@@ -163,7 +163,7 @@ class PdfEngine:
         for page in reader.pages:
             writer.add_page(page)
 
-        text_updates: Dict[str, str] = {}
+        text_updates: Dict[str, object] = {}
         checkbox_updates: Dict[str, Any] = {}
         for field_name, value in payload.items():
             kind, normalized = self._normalize_payload_value(value)
@@ -325,7 +325,7 @@ class PdfEngine:
         self,
         template_doc: fitz.Document | None,
         template_path: Path,
-        payload: Dict[str, str],
+        payload: Dict[str, object],
         output_path: Path,
     ) -> None:
         """Render field values directly onto the PDF and remove form widgets."""

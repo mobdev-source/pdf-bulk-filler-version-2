@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, MutableMapping
+from typing import Dict, Iterable, Mapping, MutableMapping
 
 from pdf_bulk_filler.mapping.rules import MappingRule, RuleType, rules_from_legacy
 
@@ -24,13 +25,46 @@ class MappingModel:
 
     def assign(self, field_name: str, rule: MappingRule | str) -> None:
         """Associate a PDF field with a rule or column."""
+        previous = self.rules.get(field_name)
+
         if isinstance(rule, MappingRule):
-            normalized = rule
+            normalized = MappingRule(
+                name=field_name,
+                rule_type=rule.rule_type,
+                targets=list(rule.targets),
+                options=copy.deepcopy(rule.options),
+            )
         else:
             normalized = MappingRule.from_direct_column(field_name, rule)
+
         normalized.name = field_name
-        normalized.targets = [field_name] if not normalized.targets else normalized.targets
-        self.rules[field_name] = normalized
+        targets = list(dict.fromkeys(t for t in (normalized.targets or []) if t))
+        if field_name not in targets:
+            targets.insert(0, field_name)
+        normalized.targets = targets or [field_name]
+
+        if normalized.type_enum() is RuleType.CHOICE:
+            self._ensure_choice_case_map(normalized.options)
+
+        previous_targets: set[str] = set(previous.targets) if previous else set()
+        new_target_set = set(normalized.targets)
+        stale_targets = previous_targets - new_target_set
+        for stale in stale_targets:
+            if stale == field_name:
+                continue
+            existing = self.rules.get(stale)
+            if existing and set(existing.targets) == previous_targets:
+                self.rules.pop(stale, None)
+
+        # Assign clones for every targeted field so the dialog shows shared rules regardless of entry point.
+        for target in normalized.targets:
+            clone = MappingRule(
+                name=target,
+                rule_type=normalized.rule_type,
+                targets=list(normalized.targets),
+                options=copy.deepcopy(normalized.options),
+            )
+            self.rules[target] = clone
 
     def remove(self, field_name: str) -> None:
         """Remove an association for the given PDF field."""
@@ -58,6 +92,33 @@ class MappingModel:
     def assignments(self) -> MutableMapping[str, MappingRule]:
         """Backward-compatible accessor exposing the internal rule map."""
         return self.rules
+
+    @staticmethod
+    def _ensure_choice_case_map(options: Dict[str, object]) -> None:
+        existing = options.get("case_map")
+        if isinstance(existing, Mapping) and existing:
+            return
+
+        cases = options.get("cases")
+        case_map: Dict[str, Dict[str, object]] = {}
+
+        if isinstance(cases, Mapping):
+            for key, outputs in cases.items():
+                if isinstance(outputs, Mapping):
+                    case_map[str(key)] = copy.deepcopy(outputs)
+        elif isinstance(cases, Iterable) and not isinstance(cases, (str, bytes)):
+            for case in cases:
+                if not isinstance(case, Mapping):
+                    continue
+                match_value = str(case.get("match", "")).strip()
+                if not match_value:
+                    continue
+                outputs = case.get("outputs")
+                if isinstance(outputs, Mapping):
+                    case_map[match_value] = copy.deepcopy(outputs)
+
+        if case_map:
+            options["case_map"] = case_map
 
 
 class MappingManager:

@@ -1384,7 +1384,7 @@ class MappingTable(QtWidgets.QTableWidget):
     def update_mapping(
         self,
         assignments: Dict[str, MappingRule],
-        previews: Dict[str, str] | None = None,
+        previews: Dict[str, object] | None = None,
     ) -> None:
         previews = previews or {}
         self.setRowCount(len(assignments))
@@ -2131,11 +2131,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_mapping_labels(self) -> None:
         rules = self._state.mapping.rules
         sample_row = self._current_sample_row()
-        sample_payload: Dict[str, str] = {}
+        sample_payload: Dict[str, object] = {}
         if sample_row:
             sample_payload = evaluate_rules(rules.values(), sample_row)
 
-        previews: Dict[str, str] = {}
+        previews: Dict[str, object] = {}
         for field_name, rule in rules.items():
             previews[field_name] = self._format_rule_preview(rule, sample_payload)
 
@@ -2191,7 +2191,7 @@ class MainWindow(QtWidgets.QMainWindow):
             columns.add(source)
         return columns
 
-    def _format_rule_preview(self, rule: MappingRule, payload: Dict[str, str]) -> str:
+    def _format_rule_preview(self, rule: MappingRule, payload: Dict[str, object]) -> str:
         if not payload:
             return ""
         values = []

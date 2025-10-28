@@ -65,6 +65,34 @@ def test_rule_evaluator_choice_emits_multiple_fields():
     assert result == {"Male": "", "Female": "Yes"}
 
 
+def test_rule_evaluator_choice_supports_column_actions():
+    row = {"Status": "Other", "Other Description": "Separated"}
+    rule = MappingRule(
+        name="Status",
+        rule_type=RuleType.CHOICE,
+        targets=["Single", "Married", "Other", "OtherText"],
+        options={
+            "source": "Status",
+            "cases": {
+                "Other": {
+                    "Other": {"mode": "checkbox", "checked": True},
+                    "OtherText": {"mode": "column", "column": "Other Description"},
+                },
+                "Single": {
+                    "Single": {"mode": "checkbox", "checked": True},
+                    "Married": {"mode": "checkbox", "checked": False},
+                },
+            },
+        },
+    )
+    evaluator = RuleEvaluator()
+
+    result = evaluator.evaluate(rule, row)
+
+    assert result["Other"] is True
+    assert result["OtherText"] == "Separated"
+
+
 def test_rule_evaluator_concat_skips_empty_segments():
     row = {"Street": "Blk 58 Lot 8 Annapolis St", "Barangay": "", "City": "Buendia"}
     rule = MappingRule(
@@ -160,6 +188,57 @@ def test_mapping_manager_roundtrip_with_rules(tmp_path: Path):
     assert restored.rule_type is RuleType.CHOICE
     assert restored.options["source"] == "Gender"
 
+
+def test_mapping_model_assign_shares_choice_rule_across_targets():
+    model = MappingModel()
+    rule = MappingRule(
+        name="Female",
+        rule_type=RuleType.CHOICE,
+        targets=["Female", "Male"],
+        options={
+            "source": "Gender",
+            "cases": [{"match": "F", "outputs": {"Female": "Yes", "Male": ""}}],
+            "default": {"Female": "", "Male": ""},
+        },
+    )
+
+    model.assign("Female", rule)
+
+    assert set(model.rules.keys()) == {"Female", "Male"}
+    female = model.resolve("Female")
+    male = model.resolve("Male")
+    assert female is not male
+    assert female.targets == ["Female", "Male"]
+    assert male.targets == ["Female", "Male"]
+    assert male.options is not female.options
+    assert male.options == female.options
+    assert male.options.get("case_map", {})["F"]["Female"] == "Yes"
+
+
+def test_mapping_model_assign_prunes_removed_targets():
+    model = MappingModel()
+    model.assign(
+        "Female",
+        MappingRule(
+            name="Female",
+            rule_type=RuleType.CHOICE,
+            targets=["Female", "Male"],
+            options={"source": "Gender", "cases": {"F": {"Female": "Yes"}}},
+        ),
+    )
+
+    model.assign(
+        "Female",
+        MappingRule(
+            name="Female",
+            rule_type=RuleType.CHOICE,
+            targets=["Female"],
+            options={"source": "Gender", "cases": {"F": {"Female": "Yes"}}},
+        ),
+    )
+
+    assert "Female" in model.rules
+    assert "Male" not in model.rules
 
 def test_mapping_rule_accepts_string_types():
     rule = MappingRule(name="Address", rule_type="concat", targets=["Address"], options={"columns": ["Street"]})

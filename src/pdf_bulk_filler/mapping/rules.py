@@ -85,8 +85,18 @@ class MappingRule:
             return f"Literal: {value}"
         if rule_type is RuleType.CHOICE:
             source = self.options.get("source", "<source>")
-            cases = self.options.get("cases", {})
-            case_count = len(cases)
+            cases = self.options.get("cases", {}) or []
+            case_map = self.options.get("case_map")
+            case_count = 0
+            if isinstance(case_map, Mapping):
+                case_count = len(case_map)
+            if not case_count:
+                if isinstance(cases, Mapping):
+                    case_count = len(cases)
+                elif hasattr(cases, "__len__"):
+                    case_count = len(cases)  # type: ignore[arg-type]
+                else:
+                    case_count = sum(1 for _ in cases)  # type: ignore[arg-type]
             return f"Choice from {source} ({case_count} cases)"
         if rule_type is RuleType.CONCAT:
             columns = self.options.get("columns", [])
@@ -107,7 +117,7 @@ class MappingRule:
 class RuleEvaluator:
     """Compute PDF payload fragments for a rule and a single data row."""
 
-    def evaluate(self, rule: MappingRule, row: Mapping[str, Any]) -> Dict[str, str]:
+    def evaluate(self, rule: MappingRule, row: Mapping[str, Any]) -> Dict[str, object]:
         """Return field values produced by ``rule``."""
         rule_type = rule.rule_type
         if isinstance(rule_type, str):
@@ -203,30 +213,112 @@ class RuleEvaluator:
         value = self._stringify(rule.options.get("value", ""), default="")
         return {target: value for target in rule.targets}
 
-    def _evaluate_choice(self, rule: MappingRule, row: Mapping[str, Any]) -> Dict[str, str]:
+    def _evaluate_choice(self, rule: MappingRule, row: Mapping[str, Any]) -> Dict[str, object]:
         options = rule.options
         source = options.get("source")
         cases = options.get("cases", {})
+        case_map = options.get("case_map")
         default = options.get("default", {})
         raw_value = row.get(source) if source else None
 
-        if raw_value in cases:
-            selected = cases[raw_value]
-        elif str(raw_value) in cases:
-            selected = cases[str(raw_value)]
-        else:
+        selected: Any = None
+        if isinstance(case_map, Mapping):
+            if raw_value in case_map:
+                selected = case_map[raw_value]
+            elif str(raw_value) in case_map:
+                selected = case_map[str(raw_value)]
+        if selected is None and isinstance(cases, Mapping):
+            if raw_value in cases:
+                selected = cases[raw_value]
+            elif str(raw_value) in cases:
+                selected = cases[str(raw_value)]
+        elif selected is None and isinstance(cases, Iterable) and not isinstance(cases, (str, bytes)):
+            for case in cases:
+                if not isinstance(case, Mapping):
+                    continue
+                match_value = case.get("match")
+                if match_value == raw_value or str(match_value) == str(raw_value):
+                    selected = case.get("outputs", {})
+                    break
+
+        if selected is None:
             selected = default
 
-        return self._normalize_choice_output(rule, selected)
+        return self._normalize_choice_output(rule, selected, row)
 
-    def _normalize_choice_output(self, rule: MappingRule, selected: Any) -> Dict[str, str]:
+    def _normalize_choice_output(
+        self,
+        rule: MappingRule,
+        selected: Any,
+        row: Mapping[str, Any],
+    ) -> Dict[str, object]:
         if isinstance(selected, Mapping):
-            result: Dict[str, str] = {}
+            result: Dict[str, object] = {}
             for key, value in selected.items():
-                result[str(key)] = self._stringify(value, default="")
+                resolved = self._resolve_choice_value(value, row)
+                if resolved is None:
+                    continue
+                if isinstance(resolved, bool):
+                    result[str(key)] = resolved
+                else:
+                    result[str(key)] = self._stringify(resolved, default="")
             return result
-        text = self._stringify(selected, default="")
+        resolved = self._resolve_choice_value(selected, row)
+        if resolved is None:
+            return {}
+        if isinstance(resolved, bool):
+            return {target: resolved for target in rule.targets}
+        text = self._stringify(resolved, default="")
         return {target: text for target in rule.targets}
+
+    def _resolve_choice_value(self, spec: Any, row: Mapping[str, Any]) -> Any:
+        if isinstance(spec, Mapping):
+            mode = str(spec.get("mode") or spec.get("kind") or spec.get("type") or "").lower()
+            if not mode:
+                if "column" in spec:
+                    mode = "column"
+                elif "checked" in spec:
+                    mode = "checkbox"
+                elif "value" in spec:
+                    mode = "literal"
+            if mode == "column":
+                column = spec.get("column")
+                fallback = spec.get("fallback", "")
+                if column:
+                    raw = row.get(column, fallback)
+                else:
+                    raw = fallback
+                if raw in (None, ""):
+                    raw = fallback
+                format_pattern = spec.get("format")
+                if isinstance(format_pattern, str) and format_pattern:
+                    try:
+                        context = {key: self._prepare_for_format(value) for key, value in row.items()}
+                        formatted = format_pattern.format(
+                            value=self._prepare_for_format(raw),
+                            **context,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    else:
+                        return formatted
+                return raw
+            if mode == "checkbox":
+                checked = spec.get("checked")
+                if isinstance(checked, bool):
+                    on_value = spec.get("value") or spec.get("checked_value") or spec.get("on")
+                    off_value = spec.get("unchecked_value") or spec.get("off")
+                    if on_value is None and off_value is None:
+                        return checked
+                    return on_value if checked else off_value
+                return bool(checked)
+            if mode in {"literal", "text", "value"}:
+                return spec.get("value", "")
+            if mode == "raw":
+                return spec.get("value")
+        if isinstance(spec, bool):
+            return spec
+        return spec
 
     def _evaluate_concat(self, rule: MappingRule, row: Mapping[str, Any]) -> Dict[str, str]:
         options = rule.options
@@ -257,10 +349,10 @@ class RuleEvaluator:
 def evaluate_rules(
     rules: Iterable[MappingRule],
     row: Mapping[str, Any],
-) -> Dict[str, str]:
+) -> Dict[str, object]:
     """Evaluate every rule and merge their outputs."""
     evaluator = RuleEvaluator()
-    payload: Dict[str, str] = {}
+    payload: Dict[str, object] = {}
     for rule in rules:
         fragment = evaluator.evaluate(rule, row)
         payload.update(fragment)
