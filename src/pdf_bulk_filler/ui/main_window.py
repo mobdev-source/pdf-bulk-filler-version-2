@@ -206,6 +206,7 @@ class ColumnListWidget(QtWidgets.QListWidget):
     def __init__(self) -> None:
         super().__init__()
         self._all_columns: list[str] = []
+        self._hidden_columns: set[str] = set()
         self._filter_text: str = ""
         self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.setDragEnabled(True)
@@ -215,12 +216,16 @@ class ColumnListWidget(QtWidgets.QListWidget):
 
     def set_columns(self, columns: Iterable[str]) -> None:
         self._all_columns = [str(column) for column in columns]
+        if self._hidden_columns:
+            available = set(self._all_columns)
+            self._hidden_columns.intersection_update(available)
         self._rebuild_visible_items()
 
     def clear(self) -> None:  # noqa: D401
         """Clear visible and cached columns."""
         super().clear()
         self._all_columns = []
+        self._hidden_columns.clear()
         self._filter_text = ""
 
     def apply_filter(self, text: str) -> None:
@@ -229,6 +234,32 @@ class ColumnListWidget(QtWidgets.QListWidget):
             return
         self._filter_text = normalized
         self._rebuild_visible_items()
+
+    def set_hidden_columns(self, columns: Iterable[str]) -> None:
+        normalized = {str(column) for column in columns if str(column)}
+        if normalized == self._hidden_columns:
+            return
+        available = set(self._all_columns)
+        self._hidden_columns = {column for column in normalized if column in available}
+        self._rebuild_visible_items()
+
+    def hide_column(self, column: str) -> None:
+        if not column:
+            return
+        if column not in self._all_columns:
+            return
+        if column in self._hidden_columns:
+            return
+        self._hidden_columns.add(column)
+        self._rebuild_visible_items()
+
+    def show_column(self, column: str) -> None:
+        if column in self._hidden_columns:
+            self._hidden_columns.remove(column)
+            self._rebuild_visible_items()
+
+    def hidden_columns(self) -> set[str]:
+        return set(self._hidden_columns)
 
     def mimeData(self, items: list[QtWidgets.QListWidgetItem]) -> QtCore.QMimeData:  # noqa: N802
         mime = QtCore.QMimeData()
@@ -241,6 +272,8 @@ class ColumnListWidget(QtWidgets.QListWidget):
         self.setUpdatesEnabled(False)
         super().clear()
         for column in self._all_columns:
+            if column in self._hidden_columns:
+                continue
             if self._filter_text and self._filter_text not in column.lower():
                 continue
             self.addItem(column)
@@ -528,6 +561,9 @@ class SpreadsheetPanel(QtWidgets.QWidget):
         self.column_search.hide()
         self.table_model.update(pd.DataFrame())
         self.data_summary_label.setText("No dataset loaded")
+
+    def set_hidden_columns(self, columns: Iterable[str]) -> None:
+        self.columns_widget.set_hidden_columns(columns)
 
 
 class DataRangeDialog(QtWidgets.QDialog):
@@ -2112,6 +2148,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 preview_value = self._render_preview_value(raw_value)
                 self.pdf_viewer.set_assignment(target, descriptor, preview_value)
         self._update_mapping_action_state()
+        self._update_hidden_columns()
 
     def _current_sample_row(self) -> Optional[Dict[str, object]]:
         if not self._state.data_sample:
@@ -2120,6 +2157,39 @@ class MainWindow(QtWidgets.QMainWindow):
         if frame.empty:
             return None
         return frame.iloc[0].to_dict()
+
+    def _update_hidden_columns(self) -> None:
+        if not hasattr(self, "spreadsheet_panel"):
+            return
+        hidden_columns = self._collect_mapped_columns()
+        self.spreadsheet_panel.set_hidden_columns(hidden_columns)
+
+    def _collect_mapped_columns(self) -> set[str]:
+        sample = self._state.data_sample
+        if not sample:
+            return set()
+        available = set(sample.columns())
+        mapped: set[str] = set()
+        for rule in self._state.mapping.rules.values():
+            mapped.update(self._extract_rule_columns(rule))
+        return {column for column in mapped if column in available}
+
+    @staticmethod
+    def _extract_rule_columns(rule: MappingRule) -> set[str]:
+        options = rule.options or {}
+        columns: set[str] = set()
+        column = options.get("column")
+        if isinstance(column, str) and column:
+            columns.add(column)
+        columns_option = options.get("columns")
+        if isinstance(columns_option, Iterable) and not isinstance(columns_option, (str, bytes)):
+            for candidate in columns_option:
+                if isinstance(candidate, str) and candidate:
+                    columns.add(candidate)
+        source = options.get("source")
+        if isinstance(source, str) and source:
+            columns.add(source)
+        return columns
 
     def _format_rule_preview(self, rule: MappingRule, payload: Dict[str, str]) -> str:
         if not payload:
